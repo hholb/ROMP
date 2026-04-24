@@ -11,6 +11,39 @@ from momp.stats.parallel import parallel_climatological_forecast_obs_pairs
 from momp.stats.parallel import parallel_forecast_obs_pairs
 from momp.stats.parallel import parallel_climatological_onset_dataset
 
+
+def prepare_score_cache(**kwargs):
+    parallel = kwargs.get('parallel')
+    ref_model = kwargs["ref_model"]
+
+    forecast_obs_df_all = (
+        parallel_forecast_obs_pairs(**kwargs)
+        if parallel
+        else multi_year_forecast_obs_pairs(**kwargs)
+    )
+
+    clim_onset = None
+    climatology_obs_df_all = None
+
+    if ref_model == "climatology":
+        clim_onset = (
+            parallel_climatological_onset_dataset(**kwargs)
+            if parallel
+            else compute_climatological_onset_dataset(**kwargs)
+        )
+        climatology_obs_df_all = (
+            parallel_climatological_forecast_obs_pairs(clim_onset, **kwargs)
+            if parallel
+            else multi_year_climatological_forecast_obs_pairs(clim_onset, **kwargs)
+        )
+
+    return {
+        "_forecast_obs_df_all": forecast_obs_df_all,
+        "_clim_onset": clim_onset,
+        "_climatology_obs_df_all": climatology_obs_df_all,
+    }
+
+
 def create_score_results(*, BS, RPS, AUC, skill_score, 
                          ref_model, ref_model_dir, ref_model_var, ref_model_file_pattern, ref_model_unit_cvt,
                          years, years_clim, obs_dir, obs_file_pattern, obs_var,
@@ -45,10 +78,12 @@ def create_score_results(*, BS, RPS, AUC, skill_score,
 
     # select bins without "Day before" and "Day After"
     #forecast_obs_df = multi_year_forecast_obs_pairs(**kwargs)
-    if parallel:
-        forecast_obs_df_all = parallel_forecast_obs_pairs(**kwargs)
-    else:
-        forecast_obs_df_all = multi_year_forecast_obs_pairs(**kwargs)
+    forecast_obs_df_all = kwargs.get("_forecast_obs_df_all")
+    if forecast_obs_df_all is None:
+        if parallel:
+            forecast_obs_df_all = parallel_forecast_obs_pairs(**kwargs)
+        else:
+            forecast_obs_df_all = multi_year_forecast_obs_pairs(**kwargs)
     forecast_obs_df = extract_pd_bins(forecast_obs_df_all, day_bins)
 
     end = time.perf_counter()
@@ -99,10 +134,12 @@ def create_score_results(*, BS, RPS, AUC, skill_score,
 
     if ref_model == "climatology":
 
-        if parallel:
-            clim_onset = parallel_climatological_onset_dataset(**kwargs)
-        else:
-            clim_onset = compute_climatological_onset_dataset(**kwargs)
+        clim_onset = kwargs.get("_clim_onset")
+        if clim_onset is None:
+            if parallel:
+                clim_onset = parallel_climatological_onset_dataset(**kwargs)
+            else:
+                clim_onset = compute_climatological_onset_dataset(**kwargs)
 
 
         #climatology_obs_df = multi_year_climatological_forecast_obs_pairs(clim_onset, **kwargs)
@@ -110,10 +147,12 @@ def create_score_results(*, BS, RPS, AUC, skill_score,
         import time
         start = time.perf_counter()
 
-        if parallel:
-            climatology_obs_df_all = parallel_climatological_forecast_obs_pairs(clim_onset, **kwargs)
-        else:
-            climatology_obs_df_all = multi_year_climatological_forecast_obs_pairs(clim_onset, **kwargs)
+        climatology_obs_df_all = kwargs.get("_climatology_obs_df_all")
+        if climatology_obs_df_all is None:
+            if parallel:
+                climatology_obs_df_all = parallel_climatological_forecast_obs_pairs(clim_onset, **kwargs)
+            else:
+                climatology_obs_df_all = multi_year_climatological_forecast_obs_pairs(clim_onset, **kwargs)
         climatology_obs_df = extract_pd_bins(climatology_obs_df_all, day_bins)
 
         end = time.perf_counter()
@@ -213,4 +252,3 @@ def create_score_results(*, BS, RPS, AUC, skill_score,
 
 
     return results
-

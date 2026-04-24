@@ -1,7 +1,8 @@
 from dataclasses import asdict
 from itertools import product
+import copy
 
-from momp.metrics.skill import create_score_results
+from momp.metrics.skill import create_score_results, prepare_score_cache
 from momp.graphics.heatmap import create_heatmap
 from momp.graphics.reliability import plot_reliability_diagram
 from momp.graphics.panel_portrait_skill import panel_portrait_bss_auc
@@ -41,6 +42,7 @@ def skill_score_in_bins(cfg=None, setting=None):
     #result_binned = {}
     result_overall = defaultdict(dict)
     result_binned = defaultdict(dict)
+    score_input_cache = {}
 
     layout_pool = iter_list(vars(cfg))
 
@@ -52,10 +54,55 @@ def skill_score_in_bins(cfg=None, setting=None):
                 f"{case.verification_window}, case: {case.case_name}")
         #print(f"processing bin skill score for {case.case_name}")
 
+        full_day_bins = cfg.day_bins
         day_bins_filtered = filter_bins_in_window(case.day_bins, case.verification_window)
-        case.day_bins = day_bins_filtered
 
+        cache_key = (
+            case.model,
+            tuple(case.years) if case.years else None,
+            tuple(case.years_clim) if case.years_clim else None,
+            case.obs_dir if hasattr(case, "obs_dir") else setting.obs_dir,
+            setting.obs_file_pattern,
+            case.obs_var,
+            case.thresh_file,
+            case.thresh_var,
+            case.wet_threshold,
+            setting.date_filter_year,
+            tuple(setting.init_days) if setting.init_days else None,
+            tuple(setting.start_date) if setting.start_date else None,
+            tuple(setting.end_date) if setting.end_date else None,
+            case.model_dir,
+            case.model_var,
+            case.file_pattern,
+            case.unit_cvt,
+            tuple(case.members) if case.members else None,
+            case.wet_init,
+            case.wet_spell,
+            case.dry_spell,
+            case.dry_threshold,
+            case.dry_extent,
+            setting.fallback_date,
+            case.mok,
+            case.onset_percentage_threshold,
+            case.max_forecast_day,
+            tuple(full_day_bins),
+            case.ref_model,
+            setting.ref_model_dir,
+            case.ref_model_var,
+            setting.ref_model_file_pattern,
+            setting.ref_model_unit_cvt,
+            setting.parallel,
+        )
+
+        if cache_key not in score_input_cache:
+            prep_case = copy.copy(case)
+            prep_case.day_bins = full_day_bins
+            prep_cfg = {**asdict(setting), **asdict(prep_case)}
+            score_input_cache[cache_key] = prepare_score_cache(**prep_cfg)
+
+        case.day_bins = day_bins_filtered
         case_cfg = {**asdict(setting), **asdict(case)}
+        case_cfg.update(score_input_cache[cache_key])
 #        print("\n\n\n members = ", case_cfg['members'])
 #        print("\n\n\n max_forecast_day = ", case_cfg['max_forecast_day'])
 #        print("\n\n\n cfg.max_forecast_day = ", cfg.max_forecast_day)
