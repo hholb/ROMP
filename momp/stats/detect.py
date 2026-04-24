@@ -496,11 +496,11 @@ def compute_onset_for_deterministic_model(p_model, thresh_slice, onset_da, *,
 
 # Function to compute onset dates for all ensemble members and save it as DataFrame
 # in binned_skill_score_cmz.py
-def compute_onset_for_all_members(p_model, thresh_slice, onset_da, *, wet_init, wet_spell, 
-                                  dry_spell, dry_threshold, dry_extent, members, onset_percentage_threshold, 
-                                  max_forecast_day, mok, end_date, **kwargs):
+def _compute_onset_for_all_members_loop(p_model, thresh_slice, onset_da, *, wet_init, wet_spell,
+                                        dry_spell, dry_threshold, dry_extent, members, onset_percentage_threshold,
+                                        max_forecast_day, mok, end_date, **kwargs):
 
-    kwargs = restore_args(compute_onset_for_all_members, kwargs, locals())
+    kwargs = restore_args(_compute_onset_for_all_members_loop, kwargs, locals())
 
     """Compute onset dates for each ensemble member, initialization time, and grid point."""
     #window = 5
@@ -833,3 +833,197 @@ def compute_onset_for_all_members(p_model, thresh_slice, onset_da, *, wet_init, 
     return onset_df, onset_mean_df
 
 
+def _valid_vectorized_member_inputs(p_model, members):
+    expected_dims = {"init_time", "member", "step", "lat", "lon"}
+    if not expected_dims.issubset(set(p_model.dims)):
+        return False
+
+    if members:
+        model_members = set(p_model.member.values.tolist())
+        return set(members).issubset(model_members)
+
+    return True
+
+
+def compute_onset_for_all_members_vectorized(
+    p_model,
+    thresh_slice,
+    onset_da,
+    *,
+    wet_init,
+    wet_spell,
+    dry_spell,
+    dry_threshold,
+    dry_extent,
+    members,
+    onset_percentage_threshold,
+    max_forecast_day,
+    mok,
+    end_date,
+    **kwargs,
+):
+    """Vectorized onset detection for the common no-post-onset-dry-window case."""
+
+    if dry_extent > wet_spell:
+        raise ValueError("vectorized onset detection supports only dry_extent <= wet_spell")
+
+    if not members:
+        members = tuple(p_model.member.values.tolist())
+    else:
+        members = tuple(members)
+
+    max_steps_needed = max_forecast_day + wet_spell - 1
+    full_steps = p_model.sizes["step"]
+    if full_steps < max_steps_needed:
+        raise ValueError(
+            f"Not enough forecast time steps: model steps {full_steps} "
+            f"< min steps required {max_steps_needed}, consider decrese dry_extent value"
+        )
+
+    p_model = p_model.sel(member=list(members), step=slice(1, max_steps_needed))
+    rain = p_model.transpose("init_time", "member", "lat", "lon", "step")
+
+    wet_spell_ok = (
+        (rain >= wet_init)
+        .rolling(step=wet_spell, min_periods=wet_spell, center=False)
+        .reduce(np.all)
+        .shift(step=-(wet_spell - 1))
+        .fillna(False)
+        .astype(bool)
+    )
+    rolling_sum = (
+        rain.rolling(step=wet_spell, min_periods=wet_spell, center=False)
+        .sum()
+        .shift(step=-(wet_spell - 1))
+    )
+    sum_ok = rolling_sum > thresh_slice
+    onset_condition = wet_spell_ok & sum_ok
+    onset_condition = onset_condition.where(onset_condition.step <= max_forecast_day, False)
+
+    if mok:
+        init_times = pd.to_datetime(onset_condition.init_time.values)
+        step_values = onset_condition.step.values.astype(int)
+        valid_step = np.zeros((len(init_times), len(step_values)), dtype=bool)
+        for t_idx, init_date in enumerate(init_times):
+            mok_date = pd.Timestamp(datetime(init_date.year, *mok))
+            forecast_dates = init_date + pd.to_timedelta(step_values, unit="D")
+            valid_step[t_idx, :] = forecast_dates.date >= mok_date.date()
+        valid_step_da = xr.DataArray(
+            valid_step,
+            dims=("init_time", "step"),
+            coords={
+                "init_time": onset_condition.init_time,
+                "step": onset_condition.step,
+            },
+        )
+        onset_condition = onset_condition & valid_step_da
+
+    obs_onset = onset_da.transpose("lat", "lon")
+    obs_values = obs_onset.values.astype("datetime64[ns]")
+    obs_valid = ~np.isnat(obs_values)
+    init_values = onset_condition.init_time.values.astype("datetime64[ns]")
+    valid_case_values = obs_valid[None, :, :] & (init_values[:, None, None] < obs_values[None, :, :])
+    valid_case = xr.DataArray(
+        valid_case_values,
+        dims=("init_time", "lat", "lon"),
+        coords={
+            "init_time": onset_condition.init_time,
+            "lat": onset_condition.lat,
+            "lon": onset_condition.lon,
+        },
+    )
+
+    cond = onset_condition.fillna(False).values.astype(bool)
+    has_onset = cond.any(axis=-1)
+    first_idx = cond.argmax(axis=-1)
+    step_values = onset_condition.step.values.astype(float)
+    onset_day_values = np.where(has_onset, step_values[first_idx], np.nan)
+
+    onset_da_members = xr.DataArray(
+        onset_day_values,
+        dims=("init_time", "member", "lat", "lon"),
+        coords={
+            "init_time": onset_condition.init_time,
+            "member": onset_condition.member,
+            "lat": onset_condition.lat,
+            "lon": onset_condition.lon,
+        },
+        name="onset_day",
+    ).where(valid_case)
+
+    obs_onset_for_cases = obs_onset.broadcast_like(valid_case).where(valid_case)
+    obs_onset_for_members = obs_onset_for_cases.broadcast_like(onset_da_members)
+
+    onset_df = onset_da_members.to_dataframe().reset_index()
+    onset_df["obs_onset_date"] = (
+        obs_onset_for_members.to_dataframe(name="obs_onset_date")
+        .reset_index()["obs_onset_date"]
+    )
+    onset_df = onset_df[onset_df["obs_onset_date"].notna()].copy()
+    onset_df["obs_onset_date"] = pd.to_datetime(onset_df["obs_onset_date"]).dt.strftime("%Y-%m-%d")
+    onset_df["onset_day"] = onset_df["onset_day"].where(onset_df["onset_day"].notna(), None)
+
+    onset_count = onset_da_members.notnull().sum("member")
+    total_members = len(members)
+    onset_percentage = onset_count / total_members if total_members > 0 else 0
+    ensemble_onset_day = onset_da_members.mean("member", skipna=True).round()
+    ensemble_onset_day = ensemble_onset_day.where(onset_percentage >= onset_percentage_threshold)
+    ensemble_onset_day = ensemble_onset_day.where(valid_case)
+
+    onset_mean_df = ensemble_onset_day.to_dataframe(name="onset_day").reset_index()
+    onset_mean_df["member_onset_count"] = (
+        onset_count.to_dataframe(name="member_onset_count").reset_index()["member_onset_count"]
+    )
+    onset_mean_df["total_members"] = total_members
+    onset_mean_df["onset_percentage"] = (
+        onset_percentage.to_dataframe(name="onset_percentage").reset_index()["onset_percentage"]
+    )
+    onset_mean_df["obs_onset_date"] = (
+        obs_onset_for_cases.to_dataframe(name="obs_onset_date").reset_index()["obs_onset_date"]
+    )
+    onset_mean_df = onset_mean_df[onset_mean_df["obs_onset_date"].notna()].copy()
+    onset_mean_df["onset_date"] = None
+
+    has_ensemble_onset = onset_mean_df["onset_day"].notna()
+    if has_ensemble_onset.any():
+        init_dates = pd.to_datetime(onset_mean_df.loc[has_ensemble_onset, "init_time"])
+        onset_days = onset_mean_df.loc[has_ensemble_onset, "onset_day"].astype(int)
+        onset_dates = init_dates + pd.to_timedelta(onset_days, unit="D")
+        onset_mean_df.loc[has_ensemble_onset, "onset_date"] = onset_dates.dt.strftime("%Y-%m-%d")
+
+    onset_mean_df["obs_onset_date"] = pd.to_datetime(onset_mean_df["obs_onset_date"]).dt.strftime("%Y-%m-%d")
+    onset_mean_df["onset_day"] = onset_mean_df["onset_day"].where(onset_mean_df["onset_day"].notna(), None)
+
+    onset_df = onset_df[["init_time", "lat", "lon", "member", "onset_day", "obs_onset_date"]]
+    onset_mean_df = onset_mean_df[
+        [
+            "init_time",
+            "lat",
+            "lon",
+            "onset_day",
+            "onset_date",
+            "member_onset_count",
+            "total_members",
+            "onset_percentage",
+            "obs_onset_date",
+        ]
+    ]
+
+    print(f"\nProcessing Summary:")
+    print(f"Generated {len(onset_df)} member-forecast combinations")
+    print(f"Found onset in {onset_df['onset_day'].notna().sum()} cases")
+    print(f"Onset rate: {onset_df['onset_day'].notna().mean():.3f}")
+
+    return onset_df, onset_mean_df
+
+
+def compute_onset_for_all_members(p_model, thresh_slice, onset_da, *, wet_init, wet_spell,
+                                  dry_spell, dry_threshold, dry_extent, members, onset_percentage_threshold,
+                                  max_forecast_day, mok, end_date, **kwargs):
+
+    kwargs = restore_args(compute_onset_for_all_members, kwargs, locals())
+
+    if dry_extent <= wet_spell and _valid_vectorized_member_inputs(p_model, members):
+        return compute_onset_for_all_members_vectorized(p_model, thresh_slice, onset_da, **kwargs)
+
+    return _compute_onset_for_all_members_loop(p_model, thresh_slice, onset_da, **kwargs)
