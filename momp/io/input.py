@@ -5,6 +5,7 @@ import pandas as pd
 import xarray as xr
 from momp.utils.standard import dim_fmt, dim_fmt_model, dim_fmt_model_ensemble
 from momp.utils.region import region_select
+from momp.utils.remap import maybe_to_adm3
 #from momp.lib.control import restore_args
 from momp.utils.practical import restore_args
 
@@ -26,6 +27,8 @@ def load_thresh_file(*, thresh_file, thresh_var, wet_threshold, region, **kwargs
         thresh_da = thresh_ds[thresh_var]
 
         thresh_da = region_select(thresh_da, region=region,  **kwargs)
+
+        thresh_da = maybe_to_adm3(thresh_da, **kwargs)
 
     #elif np.isscalar(thresh_file):
     else:
@@ -98,6 +101,8 @@ def load_imd_rainfall(year, *, obs_dir, obs_file_pattern, obs_var, obs_unit_cvt,
 
     if grid_point:
         rainfall = rainfall.sel(lat=[lat_select], lon=[lon_select])
+    else:
+        rainfall = maybe_to_adm3(rainfall, **kwargs)
 
     return rainfall
 
@@ -161,6 +166,8 @@ def get_forecast_deterministic_twice_weekly(year, *, model_dir, model_var, date_
 
     if unit_cvt:
         p_model *= unit_cvt
+
+    p_model = maybe_to_adm3(p_model, **kwargs)
 
     ds.close()
 
@@ -240,6 +247,8 @@ def get_forecast_probabilistic_twice_weekly(year, *, model_dir, model_var, date_
 
     if unit_cvt:
         p_model *= unit_cvt
+
+    p_model = maybe_to_adm3(p_model, **kwargs)
 
     #print("\n\n\n p_model = ", p_model[1,1,1,...])
     #init_times = p_model.init_time.values

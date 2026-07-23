@@ -162,6 +162,17 @@ def save_metrics_to_netcdf(spatial_metrics, attrs_dict, desc_dict=None, fname='s
 
 
 
+def save_adm3_metrics_to_csv(spatial_metrics, attrs_dict, fname='spatial_metrics'):
+    """Save per-adm3 metric DataArrays as one CSV table (adm3 x metric)."""
+    df = pd.DataFrame({name: da.to_series() for name, da in spatial_metrics.items()})
+    df.index.name = 'adm3_name'
+
+    fout = os.path.join(attrs_dict['dir_out'], "{}_{}.csv")
+    fout = fout.format(fname, attrs_dict.get('case_name', 'missing_case_name'))
+    df.to_csv(fout)
+    print(f"{fname} (adm3 table) saved to: {fout}")
+
+
 def set_nested(result_dict, keys, value):
     """build nested dictionaries on the fly based on combi, dynamic-nesting"""
     d = result_dict

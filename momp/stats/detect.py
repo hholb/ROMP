@@ -268,22 +268,18 @@ def detect_observed_onset(rain_slice, thresh_slice, year, *, wet_init, wet_spell
         vectorize=True
     )
 
-    # Convert indices to actual dates
-    valid_mask = onset_indices.values >= 0
+    # Convert indices to actual dates (vectorized, works for any spatial dims)
+    index_values = onset_indices.values
     time_coords = rain_subset.time.values
-    onset_dates_array = np.full(onset_indices.shape, np.datetime64('NaT'), dtype='datetime64[ns]')
+    valid_mask = (index_values >= 0) & (index_values < len(time_coords))
+    onset_dates_array = np.full(index_values.shape, np.datetime64('NaT'), dtype='datetime64[ns]')
+    onset_dates_array[valid_mask] = time_coords[index_values[valid_mask]]
 
-    for i in range(onset_indices.shape[0]):
-        for j in range(onset_indices.shape[1]):
-            if valid_mask[i, j]:
-                idx = int(onset_indices[i, j].values)
-                if 0 <= idx < len(time_coords):
-                    onset_dates_array[i, j] = time_coords[idx]
-
-    # Create final onset date DataArray
+    # Create final onset date DataArray on the same spatial dims as the input
     onset_da = xr.DataArray(
         onset_dates_array,
-        coords=[('lat', rain_slice.lat.values), ('lon', rain_slice.lon.values)],
+        dims=onset_indices.dims,
+        coords=onset_indices.coords,
         name='onset_date'
     )
 
@@ -297,8 +293,46 @@ def detect_observed_onset(rain_slice, thresh_slice, year, *, wet_init, wet_spell
 def compute_onset_for_deterministic_model(p_model, thresh_slice, onset_da, *,
                                           wet_init, wet_spell, dry_spell, dry_threshold, dry_extent,
                                           max_forecast_day, mok, end_date, **kwargs):
+    """Compute onset dates for a deterministic forecast.
+
+    A deterministic forecast is treated as a one-member ensemble so the
+    vectorized member implementation can be reused; the original per-point
+    loop is kept as a fallback for unexpected dimension layouts.
+    """
 
     kwargs = restore_args(compute_onset_for_deterministic_model, kwargs, locals())
+
+    spatial_dims = _spatial_dims(p_model)
+    if {"init_time", "step"}.issubset(set(p_model.dims)) and spatial_dims and "member" not in p_model.dims:
+        p_member = p_model.expand_dims(member=[0])
+        member_kwargs = dict(kwargs)
+        # with a single member the ensemble onset equals the member onset for
+        # any percentage threshold in (0, 1]
+        member_kwargs["members"] = None
+        member_kwargs["onset_percentage_threshold"] = 0.5
+        _, onset_mean_df = compute_onset_for_all_members_vectorized(
+            p_member, thresh_slice, onset_da, **member_kwargs
+        )
+        onset_df = onset_mean_df[
+            ["init_time"] + spatial_dims + ["onset_day", "onset_date", "obs_onset_date"]
+        ].reset_index(drop=True)
+        return onset_df
+
+    if "lat" not in p_model.dims:
+        raise ValueError(
+            "Deterministic onset fallback loop requires lat/lon dims; "
+            f"got dims {tuple(p_model.dims)}. adm3-remapped forecasts need "
+            "dims (init_time, step, adm3) for the vectorized path."
+        )
+
+    return _compute_onset_for_deterministic_model_loop(p_model, thresh_slice, onset_da, **kwargs)
+
+
+def _compute_onset_for_deterministic_model_loop(p_model, thresh_slice, onset_da, *,
+                                                wet_init, wet_spell, dry_spell, dry_threshold, dry_extent,
+                                                max_forecast_day, mok, end_date, **kwargs):
+
+    kwargs = restore_args(_compute_onset_for_deterministic_model_loop, kwargs, locals())
 
     #if t_idx % 5 == 0:
     """Compute onset dates for deterministic model forecast."""
@@ -833,9 +867,16 @@ def _compute_onset_for_all_members_loop(p_model, thresh_slice, onset_da, *, wet_
     return onset_df, onset_mean_df
 
 
+def _spatial_dims(p_model):
+    """Spatial dims of a forecast array (anything besides init/member/step)."""
+    return [d for d in p_model.dims if d not in ("init_time", "member", "step")]
+
+
 def _valid_vectorized_member_inputs(p_model, members):
-    expected_dims = {"init_time", "member", "step", "lat", "lon"}
+    expected_dims = {"init_time", "member", "step"}
     if not expected_dims.issubset(set(p_model.dims)):
+        return False
+    if not _spatial_dims(p_model):
         return False
 
     if members:
@@ -862,17 +903,17 @@ def compute_onset_for_all_members_vectorized(
     end_date,
     **kwargs,
 ):
-    """Vectorized onset detection for the common no-post-onset-dry-window case."""
-
-    if dry_extent > wet_spell:
-        raise ValueError("vectorized onset detection supports only dry_extent <= wet_spell")
+    """Vectorized onset detection, including the post-onset dry-window check."""
 
     if not members:
         members = tuple(p_model.member.values.tolist())
     else:
         members = tuple(members)
 
-    max_steps_needed = max_forecast_day + wet_spell - 1
+    if dry_extent <= wet_spell:
+        max_steps_needed = max_forecast_day + wet_spell - 1
+    else:
+        max_steps_needed = max_forecast_day + dry_extent
     full_steps = p_model.sizes["step"]
     if full_steps < max_steps_needed:
         raise ValueError(
@@ -881,7 +922,8 @@ def compute_onset_for_all_members_vectorized(
         )
 
     p_model = p_model.sel(member=list(members), step=slice(1, max_steps_needed))
-    rain = p_model.transpose("init_time", "member", "lat", "lon", "step")
+    spatial_dims = _spatial_dims(p_model)
+    rain = p_model.transpose("init_time", "member", *spatial_dims, "step")
 
     wet_spell_ok = (
         (rain >= wet_init)
@@ -898,6 +940,28 @@ def compute_onset_for_all_members_vectorized(
     )
     sum_ok = rolling_sum > thresh_slice
     onset_condition = wet_spell_ok & sum_ok
+
+    if dry_extent > wet_spell and dry_extent >= dry_spell:
+        # Same rule as detect_onset: onset at day d is rejected when any run of
+        # dry_spell consecutive dry days (rain < wet_init) starts within the
+        # dry_extent-day window beginning at day d. (When dry_extent < dry_spell
+        # no dry run can fit, matching detect_onset's empty convolution.)
+        dry_day = rain < wet_init
+        dry_run_start = (
+            (dry_day.rolling(step=dry_spell, min_periods=dry_spell).sum() == dry_spell)
+            .shift(step=-(dry_spell - 1))
+            .fillna(False)
+            .astype(bool)
+        )
+        dry_search = dry_extent - dry_spell + 1
+        has_dry_after = (
+            (dry_run_start.rolling(step=dry_search, min_periods=dry_search).sum() > 0)
+            .shift(step=-(dry_search - 1))
+            .fillna(False)
+            .astype(bool)
+        )
+        onset_condition = onset_condition & ~has_dry_after
+
     onset_condition = onset_condition.where(onset_condition.step <= max_forecast_day, False)
 
     if mok:
@@ -918,22 +982,19 @@ def compute_onset_for_all_members_vectorized(
         )
         onset_condition = onset_condition & valid_step_da
 
-    obs_onset = onset_da.transpose("lat", "lon")
-    obs_values = obs_onset.values.astype("datetime64[ns]")
-    obs_valid = ~np.isnat(obs_values)
-    init_values = onset_condition.init_time.values.astype("datetime64[ns]")
-    valid_case_values = obs_valid[None, :, :] & (init_values[:, None, None] < obs_values[None, :, :])
-    valid_case = xr.DataArray(
-        valid_case_values,
-        dims=("init_time", "lat", "lon"),
-        coords={
-            "init_time": onset_condition.init_time,
-            "lat": onset_condition.lat,
-            "lon": onset_condition.lon,
-        },
+    obs_onset = onset_da.transpose(*spatial_dims)
+    # xarray broadcasting by name keeps this dim-agnostic (lat/lon or adm3)
+    init_time_da = xr.DataArray(
+        onset_condition.init_time.values.astype("datetime64[ns]"),
+        dims=("init_time",),
+        coords={"init_time": onset_condition.init_time},
     )
+    valid_case = obs_onset.notnull() & (init_time_da < obs_onset)
+    valid_case = valid_case.transpose("init_time", *spatial_dims)
 
-    cond = onset_condition.fillna(False).values.astype(bool)
+    cond = onset_condition.transpose(
+        "init_time", "member", *spatial_dims, "step"
+    ).fillna(False).values.astype(bool)
     has_onset = cond.any(axis=-1)
     first_idx = cond.argmax(axis=-1)
     step_values = onset_condition.step.values.astype(float)
@@ -941,12 +1002,11 @@ def compute_onset_for_all_members_vectorized(
 
     onset_da_members = xr.DataArray(
         onset_day_values,
-        dims=("init_time", "member", "lat", "lon"),
+        dims=("init_time", "member") + tuple(spatial_dims),
         coords={
             "init_time": onset_condition.init_time,
             "member": onset_condition.member,
-            "lat": onset_condition.lat,
-            "lon": onset_condition.lon,
+            **{d: onset_condition[d] for d in spatial_dims},
         },
         name="onset_day",
     ).where(valid_case)
@@ -994,12 +1054,9 @@ def compute_onset_for_all_members_vectorized(
     onset_mean_df["obs_onset_date"] = pd.to_datetime(onset_mean_df["obs_onset_date"]).dt.strftime("%Y-%m-%d")
     onset_mean_df["onset_day"] = onset_mean_df["onset_day"].where(onset_mean_df["onset_day"].notna(), None)
 
-    onset_df = onset_df[["init_time", "lat", "lon", "member", "onset_day", "obs_onset_date"]]
+    onset_df = onset_df[["init_time"] + spatial_dims + ["member", "onset_day", "obs_onset_date"]]
     onset_mean_df = onset_mean_df[
-        [
-            "init_time",
-            "lat",
-            "lon",
+        ["init_time"] + spatial_dims + [
             "onset_day",
             "onset_date",
             "member_onset_count",
@@ -1023,7 +1080,14 @@ def compute_onset_for_all_members(p_model, thresh_slice, onset_da, *, wet_init, 
 
     kwargs = restore_args(compute_onset_for_all_members, kwargs, locals())
 
-    if dry_extent <= wet_spell and _valid_vectorized_member_inputs(p_model, members):
+    if _valid_vectorized_member_inputs(p_model, members):
         return compute_onset_for_all_members_vectorized(p_model, thresh_slice, onset_da, **kwargs)
+
+    if "lat" not in p_model.dims:
+        raise ValueError(
+            "Ensemble onset fallback loop requires lat/lon dims; "
+            f"got dims {tuple(p_model.dims)}. adm3-remapped forecasts need "
+            "dims (init_time, member, step, adm3) for the vectorized path."
+        )
 
     return _compute_onset_for_all_members_loop(p_model, thresh_slice, onset_da, **kwargs)

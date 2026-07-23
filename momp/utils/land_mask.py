@@ -9,6 +9,19 @@ from matplotlib.patches import Polygon
 from momp.utils.standard import dim_fmt
 
 
+# Caches for grid-static objects (land-sea mask, country geometry/mask, nc mask).
+# These are rebuilt identically on every region_select call otherwise, which is
+# expensive for the regionmask/shapely computations. Keys include the rounded
+# grid coordinates so a different grid never reuses a stale mask.
+_STATIC_MASK_CACHE = {}
+
+
+def _grid_cache_key(lat_values, lon_values):
+    lat = np.round(np.asarray(lat_values, dtype=float), 6)
+    lon = np.round(np.asarray(lon_values, dtype=float), 6)
+    return (lat.tobytes(), lon.tobytes())
+
+
 # Function to find grid points inside a polygon (For core-monsoon zone analysis)
 def points_inside_polygon(polygon_lon, polygon_lat, grid_lons, grid_lats):
     """
@@ -194,11 +207,16 @@ def create_land_sea_mask(
     >>> mask = create_land_sea_mask(ds, as_boolean=True)  # Generate land-sea mask (land: True, sea: False)
     """
 
-    # Use regionmask
-    land_mask = regionmask.defined_regions.natural_earth_v5_0_0.land_110
-
     lon = obj["lon"]
     lat = obj["lat"]
+
+    cache_key = ("land_sea", _grid_cache_key(lat.values, lon.values), as_boolean)
+    cached = _STATIC_MASK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Use regionmask
+    land_mask = regionmask.defined_regions.natural_earth_v5_0_0.land_110
 
     # Mask the land-sea mask to match the dataset's coordinates
     land_sea_mask = land_mask.mask(lon, lat=lat)
@@ -210,6 +228,7 @@ def create_land_sea_mask(
         # Convert the boolean land-sea mask to a 1/0 mask
         land_sea_mask = xr.where(land_sea_mask, 0, 1)
 
+    _STATIC_MASK_CACHE[cache_key] = land_sea_mask
     return land_sea_mask
 
 
@@ -245,6 +264,10 @@ def get_shp(region='Ethiopia', resolution='10m', category='cultural', name='admi
 
     import cartopy.io.shapereader as shpreader
 
+    cache_key = ("shp_geom", region, resolution, category, name)
+    if cache_key in _STATIC_MASK_CACHE:
+        return _STATIC_MASK_CACHE[cache_key]
+
     # Load Ethiopia shapefile
     ethiopia_shp = shpreader.natural_earth(resolution=resolution, category=category, name=name)
 
@@ -253,7 +276,10 @@ def get_shp(region='Ethiopia', resolution='10m', category='cultural', name='admi
     for country in shpreader.Reader(ethiopia_shp).records():
         if country.attributes['NAME'] == region:
             region_geom = country.geometry
-            return region_geom
+            break
+
+    _STATIC_MASK_CACHE[cache_key] = region_geom
+    return region_geom
 
 
 def shp_mask(da, region='Ethiopia', resolution='10m', category='cultural', name='admin_0_countries', 
@@ -268,12 +294,17 @@ def shp_mask(da, region='Ethiopia', resolution='10m', category='cultural', name=
         print("    WARNING - specified region is not in cartopy.io.shapereader")
         return da
 
-    # Create mask for Ethiopia
-    lons, lats = np.meshgrid(da.lon, da.lat)
-    points = np.column_stack((lons.ravel(), lats.ravel()))
-    mask = contains(region_geom, points[:, 0], points[:, 1])
-    mask = mask.reshape(lons.shape)
-    mask_da = xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': da.lat, 'lon': da.lon})
+    cache_key = ("shp_mask", region, resolution, category, name,
+                 _grid_cache_key(da.lat.values, da.lon.values))
+    mask_da = _STATIC_MASK_CACHE.get(cache_key)
+    if mask_da is None:
+        # Create mask for Ethiopia
+        lons, lats = np.meshgrid(da.lon, da.lat)
+        points = np.column_stack((lons.ravel(), lats.ravel()))
+        mask = contains(region_geom, points[:, 0], points[:, 1])
+        mask = mask.reshape(lons.shape)
+        mask_da = xr.DataArray(mask, dims=['lat', 'lon'], coords={'lat': da.lat, 'lon': da.lon})
+        _STATIC_MASK_CACHE[cache_key] = mask_da
 
     # Apply mask to data
     da_masked = da.where(mask_da)
@@ -355,61 +386,40 @@ def apply_nc_mask(ds, nc_mask, mask_var=None, keep_value=1):
         Masked data (values where mask is False become NaN).
     """
 
-    mask_ds = xr.open_dataset(nc_mask)
-    #print("mask_ds = ", mask_ds)
-    mask_ds = dim_fmt(mask_ds)
-    #print("\nmask_ds = ", mask_ds)
+    cache_key = ("nc_mask", str(nc_mask), mask_var, keep_value,
+                 _grid_cache_key(ds.lat.values, ds.lon.values))
+    mask_bool = _STATIC_MASK_CACHE.get(cache_key)
 
-    mask_ds = mask_ds.sel(lat=ds.lat, lon=ds.lon, method="nearest")
+    if mask_bool is None:
+        mask_ds = xr.open_dataset(nc_mask)
+        try:
+            mask_ds = dim_fmt(mask_ds)
+            mask_ds = mask_ds.sel(lat=ds.lat, lon=ds.lon, method="nearest")
 
-    # subset mask_ds according to ds region bounds
-    #mask_ds, _ = xr.align(mask_ds, ds, join="inner")
+            # pick mask variable
+            if mask_var is None:
+                if len(mask_ds.data_vars) != 1:
+                    raise ValueError(
+                        f"Mask file has multiple variables {list(mask_ds.data_vars)}; "
+                        "please specify mask_var."
+                    )
+            mask = next(iter(mask_ds.data_vars.values())) if mask_var is None else mask_ds[mask_var]
 
-    try:
-        # pick mask variable
-        if mask_var is None:
-            if len(mask_ds.data_vars) != 1:
-                raise ValueError(
-                    f"Mask file has multiple variables {list(mask_ds.data_vars)}; "
-                    "please specify mask_var."
-                )
-            mask = next(iter(mask_ds.data_vars.values()))
-        else:
-            mask = mask_ds[mask_var]
+            # convert 0/1 (or numeric) to boolean
+            if mask.dtype == bool:
+                mask_bool = mask
+            else:
+                mask_bool = (mask == keep_value)
 
-        # convert 0/1 (or numeric) to boolean
-        if mask.dtype == bool:
-            mask_bool = mask
-        else:
-            mask_bool = (mask == keep_value)
-        
-        #print("\n mask_bool = ", mask_bool)
-        #print("\n ds = ", ds)
+            mask_bool = mask_bool.load()
+            _STATIC_MASK_CACHE[cache_key] = mask_bool
+        finally:
+            mask_ds.close()
 
-        # align to prevent accidental broadcasting (and catch mismatched grids)
-        mask_bool, ds_aligned = xr.align(mask_bool, ds, join="exact")
+    # align to prevent accidental broadcasting (and catch mismatched grids)
+    mask_bool, ds_aligned = xr.align(mask_bool, ds, join="exact")
 
-        #print("\n mask_bool = ", mask_bool)
-        #print("\n ds_aligned = ", ds_aligned)
-
-        #ds_aligned = ds_aligned#.compute()
-        #mask_bool = mask_bool#.compute()
-
-        #ds_aligned = ds_aligned.chunk(mask_bool.chunksizes)
-        #ds_masked = ds_aligned.where(mask_bool).persist()
-
-        #indices = np.where(mask_bool.values)[0]
-        #ds_masked = ds_aligned.isel(time=indices)
-
-        #ds_masked = ds_aligned.copy(deep=True)
-
-        for var in ds_aligned.data_vars:
-            # This uses numpy's broadcasting which is very fast
-            ds_aligned[var].values = np.where(mask_bool.values, ds_aligned[var].values, np.nan)
-
-        #return ds_masked
-        return ds_aligned
-
-    finally:
-        mask_ds.close()
+    # xarray broadcasts by dimension name, so this works regardless of the
+    # dimension order of ds (obs time-first vs forecast lat-first data).
+    return ds_aligned.where(mask_bool)
 

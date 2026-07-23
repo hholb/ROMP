@@ -1,0 +1,121 @@
+# ==============================================================================
+# ROMP example: benchmark on adm3 (woreda) boundaries instead of the lat-lon grid
+#
+# Uses the Ethiopia data in demo/data/complete_data. Run from the repo root:
+#     momp-run -p demo/et/config_et_adm3.in
+#
+# Relative paths below resolve against the current working directory, so run
+# from the ROMP repository root.
+# ==============================================================================
+
+project_name = "adm3 benchmarking demo (Ethiopia woredas)"
+work_dir = "demo/et"     # adm3 weights are cached under {work_dir}/adm3_weights/
+pkg_dir = "."
+
+layout = ("model", "verification_window")
+
+# --- forecast model -----------------------------------------------------------
+# Deterministic example: AIFS single forecast.
+# For an ensemble run, use e.g. aifs_ens_v1 (25 members) or gencast (32) and
+# set probabilistic = True below.
+model_list = ("AIFS_single",)
+model_dir_list = ("demo/data/complete_data/aifs_single_v1", )
+model_var_list = ("tp", )
+unit_cvt_list = (None, )
+file_pattern_list = ("{}.nc", )
+
+# --- observations -------------------------------------------------------------
+obs = "CHIRPS_SAT"
+obs_dir = "demo/data/complete_data/CHIRPS_SAT"
+obs_file_pattern = ("{}.nc",)
+obs_var = "total_precipitation_24hr"
+obs_unit_cvt = None
+
+# --- reference model (baseline) ------------------------------------------------
+ref_model = "climatology"
+ref_model_dir = "demo/data/complete_data/CHIRPS_SAT"
+ref_model_file_pattern = "{}.nc"
+ref_model_var = "total_precipitation_24hr"
+ref_model_unit_cvt = None
+
+# --- region & benchmarking space ------------------------------------------------
+region = "Ethiopia"
+nc_mask = None
+shpfile_dir = None
+polygon = False
+
+# Benchmark on admin-3 polygons: rainfall is remapped to woredas (area-weighted
+# mean) right after loading; onset detection and all metrics run per woreda.
+benchmark_space = "adm3"
+adm3_shapefile = "demo/data/complete_data/shapefile/manual_zones_woredas_nobox4.shp"
+adm3_name_col = "adm3_name"
+adm3_weights_cache = None   # None = build from the shapefile and cache automatically
+
+# --- onset criteria (ICPAC definition) ------------------------------------------
+wet_init = 1
+wet_threshold = 20
+wet_spell = 3
+dry_threshold = 1
+dry_spell = 7
+dry_extent = 21
+thresh_file = None
+thresh_var = None
+onset_percentage_threshold = 0.5
+
+# --- temporal settings ----------------------------------------------------------
+start_date = (2015, 5, 1)
+end_date = (2016, 7, 31)
+start_year_clim = 2000
+end_year_clim = 2020
+# complete_data init times fall on irregular weekdays; keep all of them
+init_days = (0, 1, 2, 3, 4, 5, 6)
+date_filter_year = 2015
+
+# --- evaluation parameters -------------------------------------------------------
+# AIFS files carry 46 lead days; dry_extent=21 requires max_forecast_day <= 25
+verification_window_list = ((1, 15), (16, 25))
+tolerance_days_list = (3, 5,)
+max_forecast_day = 25
+day_bins = ((1, 5), (6, 10), (11, 15), (16, 20), (21, 25))
+
+# --- metrics ----------------------------------------------------------------------
+FAR = True
+MAE = True
+MR  = True
+
+probabilistic = False   # set True (with an ensemble model above) for BS/RPS/AUC
+members = "All"
+BS          = True
+RPS         = True
+AUC         = True
+Reliability = True
+skill_score = True
+
+# --- output -----------------------------------------------------------------------
+dir_out = "demo/et/output_adm3"
+dir_fig = "demo/et/figure_adm3"
+
+save_fig = True
+save_nc_spatial_far_mr_mae = True
+save_csv_score = True
+save_nc_climatology = True
+
+plot_spatial_far_mr_mae = True      # choropleth maps in adm3 mode
+plot_heatmap_bss_auc = True
+plot_reliability = True
+plot_climatology_onset = False      # lat-lon map; not supported in adm3 mode
+plot_panel_heatmap_error = True
+plot_panel_heatmap_skill = True
+plot_bar_bss_rpss_auc = True
+
+show_plot = False
+show_panel = False
+
+parallel = False
+debug = False
+
+# --- reserved ----------------------------------------------------------------------
+mok = (5, 15)
+years = None
+years_clim = None
+fallback_date = None

@@ -1,5 +1,15 @@
 import pandas as pd
 
+
+def loc_cols(df):
+    """Location key columns of a results DataFrame.
+
+    Returns ['adm3'] for admin-unit (adm3) benchmarking results, otherwise
+    the default grid keys ['lat', 'lon'].
+    """
+    return ["adm3"] if "adm3" in df.columns else ["lat", "lon"]
+
+
 def dim_fmt(ds):
     """Standardize dimension names"""
     coord_list = list(ds.coords.keys())

@@ -5,6 +5,7 @@ from momp.stats.detect import detect_observed_onset, compute_onset_for_determini
 from momp.stats.climatology import compute_climatological_onset, compute_climatology_as_forecast
 from momp.utils.practical import restore_args
 from momp.utils.printing import tuple_to_str_range
+from momp.utils.standard import loc_cols
 #from momp.stats.parallel import parallel_climatological_onset
 
 import numpy as np
@@ -24,134 +25,70 @@ def compute_onset_metrics_with_windows(onset_df, *, tolerance_days, verification
     forecast_bin_start = verification_window[0]
     forecast_bin_end = verification_window[1]
 
-    results_list = []
-    unique_locations = onset_df[['lat', 'lon']].drop_duplicates()
+    loc = loc_cols(onset_df)
 
-    print(f"Processing {len(unique_locations)} unique grid points...")
+    df = onset_df[loc + ['init_time', 'onset_date', 'obs_onset_date']].copy()
+    df['obs_onset_dt'] = pd.to_datetime(df['obs_onset_date'])
+    df['model_onset_dt'] = pd.to_datetime(df['onset_date'])
+    df['init_dt'] = pd.to_datetime(df['init_time'])
 
-    for idx, (_, row) in enumerate(unique_locations.iterrows()):
-        lat, lon = row['lat'], row['lon']
+    print(f"Processing {len(df[loc].drop_duplicates())} unique locations...")
 
-        #if idx % 10 == 0:
-        #    print(f"Processing grid point {idx+1}/{len(unique_locations)}: lat={lat:.2f}, lon={lon:.2f}")
+    # per-location observed onset (constant within a location-year)
+    gt = df.groupby(loc, sort=False)['obs_onset_dt'].transform('first')
 
-        grid_data = onset_df[(onset_df['lat'] == lat) & (onset_df['lon'] == lon)].copy()
+    valid_window_start = df['init_dt'] + pd.Timedelta(days=forecast_bin_start)
+    valid_window_end = df['init_dt'] + pd.Timedelta(days=forecast_bin_end)
+    whole_window_start = df['init_dt'] + pd.Timedelta(days=1)
+    whole_window_end = valid_window_end
 
-        grid_data['obs_onset_dt'] = pd.to_datetime(grid_data['obs_onset_date'])
-        grid_data['model_onset_dt'] = pd.to_datetime(grid_data['onset_date'])
-        grid_data['init_dt'] = pd.to_datetime(grid_data['init_time'])
+    is_obs_onset_in_whole_window = (whole_window_start <= gt) & (gt <= whole_window_end)
 
-        TP = 0
-        FP = 0
-        FN = 0
-        TN = 0
-        num_onset = 0
-        num_no_onset = 0
-        mae_tp = []
-        mae_fp = []
+    has_model_onset = df['model_onset_dt'].notna()
+    is_model_in_valid_window = (
+        has_model_onset
+        & (valid_window_start <= df['model_onset_dt'])
+        & (df['model_onset_dt'] <= valid_window_end)
+    )
+    abs_diff_days = (df['model_onset_dt'] - gt).dt.days.abs()
 
-        gt_grd = grid_data['obs_onset_dt'].iloc[0]
+    df['tp'] = is_model_in_valid_window & (abs_diff_days <= tolerance_days)
+    df['fp'] = is_model_in_valid_window & ~df['tp']
+    # model onset after the valid window, or no model onset at all, count as
+    # FN/TN; an onset before the valid window start counts as neither
+    miss_like = (~has_model_onset) | (has_model_onset & ~is_model_in_valid_window
+                                      & (df['model_onset_dt'] > valid_window_end))
+    df['fn'] = miss_like & is_obs_onset_in_whole_window
+    df['tn'] = miss_like & ~is_obs_onset_in_whole_window
+    df['num_onset_flag'] = is_obs_onset_in_whole_window
+    df['mae_val'] = abs_diff_days.where(df['tp'] | df['fp'])
+    df['mae_tp_val'] = abs_diff_days.where(df['tp'])
 
-        #true_onset_window_start = gt_grd - pd.Timedelta(days=tolerance_days)
-        #true_onset_window_end = gt_grd + pd.Timedelta(days=tolerance_days)
+    grouped = df.groupby(loc, sort=False)
+    metrics_df = grouped.agg(
+        total_forecasts=('init_dt', 'size'),
+        true_positive=('tp', 'sum'),
+        true_negative=('tn', 'sum'),
+        false_positive=('fp', 'sum'),
+        false_negative=('fn', 'sum'),
+        num_onset=('num_onset_flag', 'sum'),
+        mae_combined=('mae_val', 'mean'),
+        mae_tp_only=('mae_tp_val', 'mean'),
+        num_fp_errors=('fp', 'sum'),
+    ).reset_index()
 
-        for _, init_row in grid_data.iterrows():
-            t_init = init_row['init_dt']
-            model_onset = init_row['model_onset_dt']
+    metrics_df['num_no_onset'] = metrics_df['total_forecasts'] - metrics_df['num_onset']
+    metrics_df['num_tp_errors'] = metrics_df['true_positive']
+    metrics_df['tolerance_days'] = tolerance_days
+    metrics_df['verification_window'] = [verification_window] * len(metrics_df)
+    metrics_df['forecast_days'] = forecast_bin_end
 
-            valid_window_start = t_init + pd.Timedelta(days=forecast_bin_start)
-            #valid_window_end = valid_window_start + pd.Timedelta(days=forecast_bin_end - 1)
-            valid_window_end = t_init + pd.Timedelta(days=forecast_bin_end)
-
-            whole_forecast_window_start = t_init + pd.Timedelta(days=1)
-            whole_forecast_window_end = t_init + pd.Timedelta(days=forecast_bin_end)
-
-#            # Double-check: Only use forecasts initialized before the observed onset
-#            if init_date >= obs_date_dt:
-#                continue
-
-            is_obs_onset_in_whole_window = whole_forecast_window_start <= gt_grd <= whole_forecast_window_end
-
-            if is_obs_onset_in_whole_window:
-                num_onset += 1
-            else:
-                num_no_onset += 1
-
-#            # for 16-30 days, make sure no model onset occur before for day 1-15
-#            if verification_window == 1:
-#                has_model_onset = not pd.isna(model_onset)
-#            else:
-#                early_onset = 1 <= model_onset <= valid_window_start
-#                has_model_onset = not pd.isna(model_onset) and not early_onset
-
-            has_model_onset = not pd.isna(model_onset)
-
-            if has_model_onset:
-            #if has_model_onset and is_obs_onset_in_whole_window:
-                is_model_in_valid_window = valid_window_start <= model_onset <= valid_window_end
-
-                if is_model_in_valid_window:
-                    abs_diff_days = abs((model_onset - gt_grd).days)
-
-                    if abs_diff_days <= tolerance_days:
-                        TP += 1
-                        mae_tp.append(abs_diff_days)
-                    else:
-                        FP += 1
-                        mae_fp.append(abs_diff_days)
-
-                else:
-                    if model_onset > valid_window_end: #make sure no model onset in early bins
-                        if is_obs_onset_in_whole_window:
-                            FN += 1
-                        else:
-                            TN += 1
-
-            else:
-                if is_obs_onset_in_whole_window:
-                    FN += 1
-                else:
-                    TN += 1
-
-#            if lat==9.75 and lon==38.5:
-#            if lat==14.5 and lon==39.75:
-#            if lat==14.25 and lon==39.75:
-#            if lat==11.25 and lon==41.25:
-#            if lat==11.75 and lon==40.5:
-#                print("------ init time: ", t_init)
-#                print("TP, FP, FN, TN = ", TP, FP, FN, TN)
-#                print("model onset, obs onset = ", model_onset, gt_grd)
-
-        total_forecasts = len(grid_data)
-
-        mae_combined = mae_tp + mae_fp
-        mae = np.mean(mae_combined) if len(mae_combined) > 0 else np.nan
-        mae_tp_only = np.mean(mae_tp) if len(mae_tp) > 0 else np.nan
-
-        result = {
-            'lat': lat,
-            'lon': lon,
-            'total_forecasts': total_forecasts,
-            'true_positive': TP,
-            'true_negative': TN,
-            'false_positive': FP,
-            'false_negative': FN,
-            'num_onset': num_onset,
-            'num_no_onset': num_no_onset,
-            'mae_combined': mae,
-            'mae_tp_only': mae_tp_only,
-            'num_tp_errors': len(mae_tp),
-            'num_fp_errors': len(mae_fp),
-            'tolerance_days': tolerance_days,
-            'verification_window': verification_window, #forecast_bin,
-            'forecast_days': forecast_bin_end
-        }
-        results_list.append(result)
-
-#    import sys
-#    sys.exit()
-
-    metrics_df = pd.DataFrame(results_list)
+    metrics_df = metrics_df[loc + [
+        'total_forecasts', 'true_positive', 'true_negative', 'false_positive',
+        'false_negative', 'num_onset', 'num_no_onset', 'mae_combined',
+        'mae_tp_only', 'num_tp_errors', 'num_fp_errors', 'tolerance_days',
+        'verification_window', 'forecast_days'
+    ]]
 
     summary_stats = {
         'total_grid_points': len(metrics_df),

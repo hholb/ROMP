@@ -104,6 +104,12 @@ class Setting:
     shpfile_dir: Optional[str] = field(default=None)
     nc_mask: Optional[str] = field(default=None)
 
+    # spatial benchmarking space: "grid" (lat-lon) or "adm3" (admin-3 polygons)
+    benchmark_space: str = field(default="grid")
+    adm3_shapefile: Optional[str] = field(default=None)
+    adm3_name_col: str = field(default="adm3_name")
+    adm3_weights_cache: Optional[str] = field(default=None)
+
     obs_file_pattern: str = field(default="{}.nc")
     ref_model_file_pattern: Optional[str] = field(default="{}.nc")
     

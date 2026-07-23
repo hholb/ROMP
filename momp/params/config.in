@@ -86,6 +86,22 @@ shpfile_dir = None
 # Mask/boundary as region polygons, if True must define in params/region_def
 polygon = False
 
+# Spatial benchmarking space: "grid" evaluates on the native lat-lon grid;
+# "adm3" remaps rainfall to admin-level-3 polygons (area-weighted mean) right
+# after loading, then detects onset and computes all metrics per adm3 unit.
+benchmark_space = "grid"
+
+# Shapefile with adm3 boundaries (required when benchmark_space = "adm3").
+adm3_shapefile = None
+
+# Attribute column in the shapefile holding the adm3 unit names.
+adm3_name_col = "adm3_name"
+
+# Optional explicit grid-to-adm3 weights CSV (columns: lat, lon, adm3_name,
+# weight). Default None builds the weights from the shapefile and caches them
+# under {work_dir}/adm3_weights/.
+adm3_weights_cache = None
+
 # ------------------------------------------------------------------------------
 # 6. ONSET CRITERIA (Physics Logic)
 # ------------------------------------------------------------------------------

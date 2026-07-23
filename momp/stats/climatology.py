@@ -1,6 +1,7 @@
 from momp.io.input import load_imd_rainfall, load_thresh_file, get_initialization_dates
 from momp.stats.detect import detect_observed_onset
 from momp.utils.practical import restore_args
+from momp.utils.standard import loc_cols
 #from momp.stats.benchmark import compute_onset_metrics_with_windows
 
 import numpy as np
@@ -133,155 +134,64 @@ def compute_climatology_as_forecast(climatological_onset_doy, year, init_dates, 
     pandas DataFrame with climatology forecast results
     """
     
-    #mok = kwargs['mok']
+    spatial_dims = list(climatological_onset_doy.dims)
 
-    results_list = []
-    
-    # Get dimensions
-    lats = climatological_onset_doy.lat.values
-    lons = climatological_onset_doy.lon.values
-
-    #end_MMDD = kwargs["end_date"][1:]
-    
-    print(f"Processing climatology as forecast for {len(init_dates)} init times x {len(lats)} lats x {len(lons)} lons...")
+    print(f"Processing climatology as forecast for {len(init_dates)} init times x "
+          + " x ".join(f"{climatological_onset_doy.sizes[d]} {d}s" for d in spatial_dims) + "...")
     print(f"Year: {year}")
-    #print(f"Only processing forecasts initialized before observed onset dates")
-    
-    # Track statistics
-    total_potential_inits = 0
-    valid_inits = 0
-    skipped_no_obs = 0
-    skipped_late_init = 0
-    onsets_forecasted = 0
-    
-    # Loop over all initialization dates and grid points
-    for t_idx, init_time in enumerate(init_dates):
-        #if t_idx % 5 == 0:  # Print progress every 5 init times
-        #    print(f"Processing init time {t_idx+1}/{len(init_dates)}: {init_time.strftime('%Y-%m-%d')}")
-        
-        init_date = pd.to_datetime(init_time)
-        year = init_date.year
-        #end_date = datetime(year, *end_MMDD)
-#        print(f"init_time {init_time}, {type(init_time)}")
-#        print(f"init_date {init_date}, {type(init_date)}")
-#        print(f"init_dates {init_dates}, {type(init_dates)}")
-#        sys.exit()
 
-        if mok:
-            mok_date = datetime(year, *mok)  # June 2nd of the same year
-        
-        for i, lat in enumerate(lats):
-            for j, lon in enumerate(lons):
-                
-                total_potential_inits += 1
-#                print(f"available init {init_date}") if lat==11.75 and lon==40.5 else None
-                
-                # Get observed onset date for this grid point
-                try:
-                    obs_onset = observed_onset_da.isel(lat=i, lon=j).values
-                except:
-                    skipped_no_obs += 1
-                    continue
-                
-#                print("1111111111") if lat==11.75 and lon==40.5 else None
-                #if pd.to_datetime(obs_onset) > end_date:
-                #    skipped_no_obs += 1
-                #    continue
-#                print("2222222") if lat==11.75 and lon==40.5 else None
+    # location table: observed onset + climatological onset doy per grid point
+    obs_df = observed_onset_da.to_dataframe(name='obs_onset_dt').reset_index()
+    clim_df = climatological_onset_doy.to_dataframe(name='climatological_onset_doy').reset_index()
+    loc = loc_cols(obs_df)
+    base = obs_df.merge(clim_df[loc + ['climatological_onset_doy']], on=loc)
 
-                # Skip if no observed onset
-                if pd.isna(obs_onset):
-                    skipped_no_obs += 1
-                    continue
-#                print("3333333") if lat==11.75 and lon==40.5 else None
-                
-                # Convert observed onset to datetime
-                obs_onset_dt = pd.to_datetime(obs_onset)
-                
-                # Only process if forecast was initialized before observed onset
-                if init_date >= obs_onset_dt:
-                    skipped_late_init += 1
-                    continue
- #               print("4444444") if lat==11.75 and lon==40.5 else None
-                
-                valid_inits += 1
-                
-                # Get climatological onset day of year for this grid point
-                clim_onset_doy = climatological_onset_doy.isel(lat=i, lon=j).values
-                
-                # Skip if no climatological onset available
-                # Bug fix from original code which directly skip/continue if no clim onset
-                if np.isnan(clim_onset_doy):
-                    onset_day, onset_date = None, None
-                    result = {
-                        'init_time': init_time,
-                        'lat': lat,
-                        'lon': lon,
-                        'onset_day': onset_day,  # None if no onset forecasted
-                        'onset_date': onset_date.strftime('%Y-%m-%d') if onset_date is not None else None,
-                        'climatological_onset_doy': clim_onset_doy,
-                        'climatological_onset_date': clim_onset_date.strftime('%Y-%m-%d'),
-                        'obs_onset_date': obs_onset_dt.strftime('%Y-%m-%d')  # Store observed onset for reference
-                    }
-                    results_list.append(result)
-                    continue
-                
-#                print(f"5555 {clim_onset_doy}") if lat==11.75 and lon==40.5 else None
-                # Convert climatological day of year to actual date for this year
-                try:
-                    clim_onset_date = datetime(year, 1, 1) + timedelta(days=int(clim_onset_doy) - 1)
-                    clim_onset_date = pd.to_datetime(clim_onset_date)
-                except:
-                    continue  # Skip if invalid day of year
-                
-                # Check if climatological onset is within forecast window
-                forecast_window_start = init_date + pd.Timedelta(days=1)
-                forecast_window_end = init_date + pd.Timedelta(days=max_forecast_day)
-                
-                onset_day = None
-                onset_date = None
-                
-#                print(f"XXXxx clim_onset_date {clim_onset_date}") if lat==11.75 and lon==40.5 else None
-#                print(f"init {init_date}") if lat==11.75 and lon==40.5 else None
-#                print(f"{forecast_window_start} {forecast_window_end}") if lat==11.75 and lon==40.5 else None
-                if forecast_window_start <= clim_onset_date <= forecast_window_end:
-                    # Climatological onset is within forecast window
-                    onset_day = (clim_onset_date - init_date).days
-                    
-#                    print(f"XXXxx onset_day {onset_day}") if lat==11.75 and lon==40.5 else None
-                    # Apply MOK filtering if requested
-                    if mok:
-                        if clim_onset_date.date() >= mok_date.date():
-                            # Valid onset after MOK date
-                            onset_date = clim_onset_date
-                            onsets_forecasted += 1
-#                            print(f"PPPPP  onset_day {onset_day}") if lat==11.75 and lon==40.5 else None
-                        else:
-                            # Reset if before MOK date
-                            onset_day = None
-                            onset_date = None
-#                            print(f"YYYYY onset_day {onset_day}") if lat==11.75 and lon==40.5 else None
-                    else:
-                        # No MOK filtering
-                        onset_date = clim_onset_date
-                        onsets_forecasted += 1
-#                        print(f"ZZZZZ onset_day {onset_day}") if lat==11.75 and lon==40.5 else None
-                
-                # Store result
-                result = {
-                    'init_time': init_time,
-                    'lat': lat,
-                    'lon': lon,
-                    'onset_day': onset_day,  # None if no onset forecasted
-                    'onset_date': onset_date.strftime('%Y-%m-%d') if onset_date is not None else None,
-                    'climatological_onset_doy': clim_onset_doy,
-                    'climatological_onset_date': clim_onset_date.strftime('%Y-%m-%d'),
-                    'obs_onset_date': obs_onset_dt.strftime('%Y-%m-%d')  # Store observed onset for reference
-                }
-                results_list.append(result)
-    
-    # Convert to DataFrame
-    climatology_forecast_df = pd.DataFrame(results_list)
+    total_potential_inits = len(init_dates) * len(base)
+
+    base = base[base['obs_onset_dt'].notna()]
+    skipped_no_obs = total_potential_inits - len(init_dates) * len(base)
+
+    # cross-join init dates x locations (init outer, locations in grid order)
+    init_df = pd.DataFrame({'init_time': pd.to_datetime(init_dates)})
+    df = init_df.merge(base, how='cross')
+
+    # only forecasts initialized before the observed onset
+    late = df['init_time'] >= df['obs_onset_dt']
+    skipped_late_init = int(late.sum())
+    df = df[~late].copy()
+    valid_inits = len(df)
+
+    init_year = df['init_time'].dt.year
+
+    # climatological doy -> date in the init year (NaT where doy is NaN)
+    clim_onset_date = (
+        pd.to_datetime(dict(year=init_year, month=1, day=1))
+        + pd.to_timedelta(df['climatological_onset_doy'] - 1, unit='D')
+    )
+
+    forecast_window_start = df['init_time'] + pd.Timedelta(days=1)
+    forecast_window_end = df['init_time'] + pd.Timedelta(days=max_forecast_day)
+    in_window = (forecast_window_start <= clim_onset_date) & (clim_onset_date <= forecast_window_end)
+
+    if mok:
+        mok_date = pd.to_datetime(dict(year=init_year, month=mok[0], day=mok[1]))
+        has_onset = in_window & (clim_onset_date >= mok_date)
+    else:
+        has_onset = in_window
+
+    onset_day = (clim_onset_date - df['init_time']).dt.days.where(has_onset)
+    onsets_forecasted = int(has_onset.sum())
+
+    df['onset_day'] = onset_day.astype(object).where(onset_day.notna(), None)
+    df['onset_date'] = clim_onset_date.dt.strftime('%Y-%m-%d').where(has_onset, None)
+    df['climatological_onset_date'] = clim_onset_date.dt.strftime('%Y-%m-%d').where(
+        clim_onset_date.notna(), None)
+    df['obs_onset_date'] = df['obs_onset_dt'].dt.strftime('%Y-%m-%d')
+
+    climatology_forecast_df = df[
+        ['init_time'] + loc + ['onset_day', 'onset_date', 'climatological_onset_doy',
+                               'climatological_onset_date', 'obs_onset_date']
+    ].reset_index(drop=True)
     
     print(f"\nClimatology Forecast Summary:")
     print(f"Total potential initializations: {total_potential_inits}")
@@ -359,8 +269,8 @@ def compute_climatological_onset_dataset(*, obs_dir, obs_file_pattern, obs_var, 
 
             print(f"Year {year}: Found onset in {valid_onsets}/{total_points} grid points ({valid_onsets/total_points:.1%})")
 
-            # Store the onset array
-            onset_arrays.append(onset_da.values)
+            # Store the onset array (with its spatial dims/coords)
+            onset_arrays.append(onset_da)
             valid_years.append(year)
 
         except Exception as e:
@@ -370,28 +280,16 @@ def compute_climatological_onset_dataset(*, obs_dir, obs_file_pattern, obs_var, 
     if not onset_arrays:
         raise ValueError("No years were successfully processed")
 
-    # Stack all onset arrays into a 3D array
-    onset_3d = np.stack(onset_arrays, axis=0)
-
-#    print("\n onset_3d = ", onset_3d)
-#    print("\n thresh_slice = ", thresh_slice)
-#    print("\n onset_da = ", onset_da)
-    # Create the final DataArray
-    climatological_onset_da = xr.DataArray(
-        onset_3d,
-        coords=[
-            ('year', valid_years),
-            ('lat', rainfall_ds.lat.values),
-            ('lon', rainfall_ds.lon.values)
-        ],
-        name='climatological_onset_dates',
-        attrs={
-            'description': 'Onset dates for climatological ensemble',
-            'method': 'MOK {mok} filter' if mok else 'no date filter',
-            'years_processed': valid_years,
-            'total_years': len(valid_years)
-        }
-    )
+    # Stack all yearly onset arrays along a new 'year' dimension
+    # (dim-agnostic: works for (lat, lon) grids and 1-D adm3 units alike)
+    climatological_onset_da = xr.concat(
+        onset_arrays, dim=pd.Index(valid_years, name='year')
+    ).rename('climatological_onset_dates').assign_attrs({
+        'description': 'Onset dates for climatological ensemble',
+        'method': 'MOK {mok} filter' if mok else 'no date filter',
+        'years_processed': valid_years,
+        'total_years': len(valid_years)
+    })
 
     # Print summary statistics
     total_possible = len(valid_years) * rainfall_ds[0].size
@@ -401,7 +299,8 @@ def compute_climatological_onset_dataset(*, obs_dir, obs_file_pattern, obs_var, 
     print(f"CLIMATOLOGICAL ONSET DATASET SUMMARY")
     print(f"{'='*60}")
     print(f"Years processed: {len(valid_years)} ({min(valid_years)}-{max(valid_years)})")
-    print(f"Spatial domain: {len(rainfall_ds.lat)} lats x {len(rainfall_ds.lon)} lons")
+    spatial_desc = " x ".join(f"{onset_arrays[0].sizes[d]} {d}" for d in onset_arrays[0].dims)
+    print(f"Spatial domain: {spatial_desc}")
     print(f"Total valid onsets: {total_valid:,}/{total_possible:,} ({total_valid/total_possible:.1%})")
     print(f"Method: {'MOK ({mok} filter)' if mok else 'No date filter'}")
 

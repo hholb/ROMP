@@ -6,6 +6,7 @@ from momp.io.input import load_imd_rainfall
 from momp.stats.detect import detect_observed_onset, compute_onset_for_all_members
 #from momp.lib.control import restore_args
 from momp.utils.practical import restore_args
+from momp.utils.standard import loc_cols
 #from momp.stats.climatology import compute_climatological_onset_dataset
 from itertools import product
 
@@ -61,145 +62,74 @@ def create_forecast_observation_pairs_with_bins(onset_all_members, onset_da, *, 
     max_forecast_day = max(day_bins)[1]
     min_forecast_day = min(day_bins)[0]
 
-    results_list = []
-
-    # Get unique combinations of init_time, lat, lon from the filtered forecast data
-    forecast_groups = onset_all_members.groupby(['init_time', 'lat', 'lon'])
+    loc = loc_cols(onset_all_members)
+    keys = ['init_time'] + loc
 
     # Add the "after max_forecast_day" bin
-    #extended_bins = day_bins + ((max_forecast_day + 1, float('inf')),)
     extended_bins = ((-float('inf'), min_forecast_day - 1),) + day_bins + ((max_forecast_day + 1, float('inf')),)
-#    print("\n\n\n XXXXXXXX extended_bins = ", extended_bins)
 
-    print(f"Processing {len(forecast_groups)} forecast cases with day bins: {day_bins}")
+    df = onset_all_members[keys + ['onset_day', 'obs_onset_date']].copy()
+    df['init_dt'] = pd.to_datetime(df['init_time'])
+    df['obs_dt'] = pd.to_datetime(df['obs_onset_date'])
+
+    # keep only valid cases (observed onset exists and init precedes it);
+    # member rows are only ever produced for valid cases, so this is a
+    # safety net matching the original per-group skips
+    df = df[df['obs_dt'].notna() & (df['init_dt'] < df['obs_dt'])]
+
+    onset_day = pd.to_numeric(df['onset_day'], errors='coerce')
+
+    print(f"Processing {len(df[keys].drop_duplicates())} forecast cases with day bins: {day_bins}")
     print(f"Including 'after day {max_forecast_day}' bin for members without onset in forecast window")
 
-    for (init_time, lat, lon), group in forecast_groups:
+    obs_days_from_init = (df['obs_dt'] - df['init_dt']).dt.days
 
-#        print("init_time, lat, lon = ", init_time, lat, lon)
-        # Get observed onset for this location
-        try:
-#            print("onset_da.lat.values = ", onset_da.lat.values)
-#            print("lat = ,", lat)
-#            print("np.abs(onset_da.lat.values - lat) = ", np.abs(onset_da.lat.values - lat))
-            lat_idx = np.where(np.abs(onset_da.lat.values - lat) < 0.01)[0][0]
-            lon_idx = np.where(np.abs(onset_da.lon.values - lon) < 0.01)[0][0]
-#            print("lat_idx = ", lat_idx, "  lon_idx = ", lon_idx)
-#            print("onset_da = ", onset_da)
-            obs_date = onset_da.isel(lat=lat_idx, lon=lon_idx).values
-        except:
-            continue
+    # per-member membership and per-case observed indicator for every bin
+    bin_frames = []
+    for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
+        if bin_start == -float('inf'):
+            bin_label = f'Before day {min_forecast_day}'
+            member_in_bin = onset_day.notna() & (onset_day < min_forecast_day)
+            observed_onset = obs_days_from_init < min_forecast_day
+        elif bin_start > max_forecast_day:
+            bin_label = f'After day {max_forecast_day}'
+            member_in_bin = onset_day.isna() | (onset_day > max_forecast_day)
+            observed_onset = obs_days_from_init > max_forecast_day
+        else:
+            bin_label = f'Days {bin_start}-{bin_end}'
+            member_in_bin = onset_day.notna() & (onset_day >= bin_start) & (onset_day <= bin_end)
+            observed_onset = (obs_days_from_init >= bin_start) & (obs_days_from_init <= bin_end)
 
-        # Handle different types of obs_onset values
-        if hasattr(obs_date, 'item'):
-            obs_date = obs_date.item()
+        per_case = pd.DataFrame({
+            **{k: df[k] for k in keys},
+            'members_with_onset': member_in_bin.astype(int),
+            'observed_onset': observed_onset.astype(int),
+            'obs_dt': df['obs_dt'],
+        }).groupby(keys, as_index=False).agg(
+            members_with_onset=('members_with_onset', 'sum'),
+            observed_onset=('observed_onset', 'first'),
+            total_members=('members_with_onset', 'size'),
+            obs_dt=('obs_dt', 'first'),
+        )
+        per_case['bin_start'] = bin_start
+        per_case['bin_end'] = bin_end
+        per_case['bin_label'] = bin_label
+        per_case['bin_index'] = bin_idx
+        bin_frames.append(per_case)
 
-#        print("AAAAAA")
-        # Skip if no observed onset
-        if pd.isna(obs_date):
-            continue
+    forecast_obs_df = pd.concat(bin_frames, ignore_index=True)
+    forecast_obs_df = forecast_obs_df.sort_values(keys + ['bin_index'],
+                                                  kind='stable').reset_index(drop=True)
+    forecast_obs_df['predicted_prob'] = (
+        forecast_obs_df['members_with_onset'] / forecast_obs_df['total_members']
+    )
+    forecast_obs_df['year'] = pd.to_datetime(forecast_obs_df['init_time']).dt.year
+    forecast_obs_df['obs_onset_date'] = forecast_obs_df['obs_dt'].dt.strftime('%Y-%m-%d')
 
-        # Convert dates for comparison
-        init_date = pd.to_datetime(init_time)
-        obs_date_dt = pd.to_datetime(obs_date)
-
-        # Double-check: Only use forecasts initialized before the observed onset
-        if init_date >= obs_date_dt:
-            continue
-
-#        print("BBBBBB")
-        
-        total_members = len(group)
-
-        # For each day bin (including the "after max_forecast_day" bin)
-        for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
-
-            if bin_start == -float('inf'):
-            #if bin_start < min_forecast_day:
-                bin_label = f'Before day {min_forecast_day}'
-
-                # Check if observed onset occurs before window start 
-                forecast_start_date = init_date + pd.Timedelta(days=min_forecast_day)
-                observed_onset = int(obs_date_dt.date() < forecast_start_date.date())
-
-                # Count members that didn't predict onset within forecast window
-                members_with_onset_in_bin = 0
-                #total_members = len(group)
-
-                for member_idx, member_row in group.iterrows():
-                    member_onset_day = member_row['onset_day']
-
-                    # Member predicts < min_forecast_day
-                    if pd.notna(member_onset_day) and member_onset_day < min_forecast_day:
-                        members_with_onset_in_bin += 1
-
-
-            # Handle the "after max_forecast_day" bin differently
-            #if bin_start > max_forecast_day:
-            elif bin_start > max_forecast_day:
-                bin_label = f'After day {max_forecast_day}'
-
-                # Check if observed onset occurs after max_forecast_day
-                forecast_end_date = init_date + pd.Timedelta(days=max_forecast_day)
-                observed_onset = int(obs_date_dt.date() > forecast_end_date.date())
-
-                # Count members that didn't predict onset within forecast window
-                members_with_onset_in_bin = 0
-                #total_members = len(group)
-
-                for member_idx, member_row in group.iterrows():
-                    member_onset_day = member_row['onset_day']
-
-                    # Member predicts "after day X" if onset_day is NaN or > max_forecast_day
-                    if pd.isna(member_onset_day) or member_onset_day > max_forecast_day:
-                        members_with_onset_in_bin += 1
-
-            else:
-                # Regular bin within forecast window
-                bin_label = f'Days {bin_start}-{bin_end}'
-
-                # Calculate the date range for this bin
-                bin_start_date = init_date + pd.Timedelta(days=bin_start)
-                bin_end_date = init_date + pd.Timedelta(days=bin_end)
-
-                # Check if observed onset falls within this day bin
-                observed_onset = int(bin_start_date.date() <= obs_date_dt.date() <= bin_end_date.date())
-
-                # Calculate ensemble probability for this day bin
-                members_with_onset_in_bin = 0
-                #total_members = len(group)
-
-                for member_idx, member_row in group.iterrows():
-                    member_onset_day = member_row['onset_day']
-
-                    if pd.notna(member_onset_day) and bin_start <= member_onset_day <= bin_end:
-                        members_with_onset_in_bin += 1
-
-            # Calculate probability
-            predicted_prob = members_with_onset_in_bin / total_members
-
-            # Store result
-            result = {
-                'init_time': init_time,
-                'lat': lat,
-                'lon': lon,
-                #'bin_start': bin_start if bin_start <= max_forecast_day else max_forecast_day + 1,
-                #'bin_end': bin_end if bin_end <= max_forecast_day else float('inf'),
-                'bin_start': bin_start,
-                'bin_end': bin_end,
-                'bin_label': bin_label,
-                'predicted_prob': predicted_prob,
-                'observed_onset': observed_onset,
-                'members_with_onset': members_with_onset_in_bin,
-                'total_members': total_members,
-                'year': pd.to_datetime(init_time).year,
-                'obs_onset_date': obs_date_dt.strftime('%Y-%m-%d'),
-                'bin_index': bin_idx
-            }
-            results_list.append(result)
-
-    # Convert to DataFrame
-    forecast_obs_df = pd.DataFrame(results_list)
+    forecast_obs_df = forecast_obs_df[keys + [
+        'bin_start', 'bin_end', 'bin_label', 'predicted_prob', 'observed_onset',
+        'members_with_onset', 'total_members', 'year', 'obs_onset_date', 'bin_index'
+    ]]
 #    print("result_list = ", results_list)
 #    print("forecast_obs_df = ", forecast_obs_df)
     #if 2 > 1:
@@ -259,8 +189,6 @@ def create_climatological_forecast_obs_pairs(clim_onset, target_year, init_dates
     max_forecast_day = max(day_bins)[1]
     min_forecast_day = min(day_bins)[0]
 
-    results_list = []
-
     # Get the observed onset for the target year
     if target_year not in clim_onset.year.values:
         raise ValueError(f"Target year {target_year} not found in climatological dataset")
@@ -269,215 +197,141 @@ def create_climatological_forecast_obs_pairs(clim_onset, target_year, init_dates
 
     # Use ALL years as ensemble members (including target year) ### redundant
     ensemble_years = list(clim_onset.year.values)
-    ensemble_onset_da = clim_onset.sel(year=ensemble_years)
+    total_members = len(ensemble_years)
 
     # Create extended bins including "before initialization" and "after max_forecast_day" bins
-    #extended_bins = ((-float('inf'), 0),) + day_bins + ((max_forecast_day + 1, float('inf')),)
     extended_bins = ((-float('inf'), min_forecast_day - 1),) + day_bins + ((max_forecast_day + 1, float('inf')),)
 
     print(f"Creating climatological forecasts for target year {target_year}")
     print(f"Using {len(ensemble_years)} years as ensemble members: {ensemble_years}")
     print(f"Processing {len(init_dates)} initialization dates")
     print(f"Day bins: {day_bins}")
-    #print(f"Extended bins include: 'Before initialization' and 'After day {max_forecast_day}' ")
     print(f"Extended bins include: 'Before day {min_forecast_day}' and 'After day {max_forecast_day}' ")
     print(f"Using day-of-year method for onset comparison")
 
-    # Get the actual lat/lon coordinates from the data
-    lats = obs_onset_da.lat.values
-    lons = obs_onset_da.lon.values
+    loc = [d for d in obs_onset_da.dims]
+    print("Processing " + " x ".join(f"{obs_onset_da.sizes[d]} {d}" for d in loc) + " locations")
 
-    # Create unique lat-lon pairs (no repetition)
-    #unique_pairs = list(zip(lons, lats))
-    unique_pairs = list(product(lons, lats))
+    # long member table: one row per (location, ensemble-year member)
+    ens_df = clim_onset.to_dataframe(name='ens_onset').reset_index()
+    ens_df['ens_doy'] = pd.to_datetime(ens_df['ens_onset']).dt.dayofyear
+    ens_df = ens_df.sort_values(loc + ['year'], kind='stable')
 
-    print(f"Processing {len(unique_pairs)} unique lat-lon pairs")
+    obs_df = obs_onset_da.to_dataframe(name='obs_onset').reset_index()[loc + ['obs_onset']]
+    obs_df = obs_df[obs_df['obs_onset'].notna()].copy()
+    obs_df['obs_onset_dt'] = pd.to_datetime(obs_df['obs_onset'])
+    obs_df['obs_onset_doy'] = obs_df['obs_onset_dt'].dt.dayofyear
 
-    # Process each initialization date and location
-    for init_date in init_dates:
-        init_date = pd.to_datetime(init_date)
-        init_doy = init_date.dayofyear  # Day of year for initialization
+    frames = []
+    for init_date in pd.to_datetime(init_dates):
+        init_doy = int(init_date.dayofyear)
 
-        # Loop over unique lat-lon pairs
-        for pair_idx, (lon, lat) in enumerate(unique_pairs):
+        # only forecasts initialized before the observed onset (by day of year)
+        valid_obs = obs_df[obs_df['obs_onset_doy'] > init_doy]
+        if valid_obs.empty:
+            continue
 
-            # Get observed onset for this location and target year
-            try:
-                lat_idx = np.where(np.abs(obs_onset_da.lat.values - lat) < 0.01)[0][0]
-                lon_idx = np.where(np.abs(obs_onset_da.lon.values - lon) < 0.01)[0][0]
-                obs_onset = obs_onset_da.isel(lat=lat_idx, lon=lon_idx).values
-            except:
-                continue
+        m = ens_df.merge(
+            valid_obs[loc + ['obs_onset_dt', 'obs_onset_doy']], on=loc, how='inner'
+        )
+        member_days = m['ens_doy'] - init_doy
+        obs_days = m['obs_onset_doy'] - init_doy
 
-            # Handle different types of obs_onset values
-            if hasattr(obs_onset, 'item'):
-                obs_onset = obs_onset.item()
+        for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
+            if bin_start == -float('inf'):
+                bin_label = f'Before day {min_forecast_day}'
+                in_bin = member_days.notna() & (member_days <= min_forecast_day - 1)
+                # original quirk: contributing years for this bin use <= 0,
+                # not <= min_forecast_day - 1
+                contributes = member_days.notna() & (member_days <= 0)
+                observed = (obs_days <= min_forecast_day - 1)
+            elif bin_start > max_forecast_day:
+                bin_label = f'After day {max_forecast_day}'
+                in_bin = member_days.notna() & (member_days > max_forecast_day)
+                contributes = in_bin
+                observed = (obs_days > max_forecast_day)
+            else:
+                bin_label = f'Days {bin_start}-{bin_end}'
+                in_bin = member_days.notna() & (member_days >= bin_start) & (member_days <= bin_end)
+                contributes = in_bin
+                observed = (obs_days >= bin_start) & (obs_days <= bin_end)
 
-            # Skip if no observed onset
-            if pd.isna(obs_onset):
-                continue
+            m[f'in_{bin_idx}'] = in_bin.astype(int)
+            # rows are year-sorted within each location, so concatenation
+            # reproduces the original sorted year list
+            m[f'ct_{bin_idx}'] = np.where(contributes, m['year'].astype(str) + ',', '')
+            m[f'ob_{bin_idx}'] = observed.astype(int)
 
-            obs_onset_dt = pd.to_datetime(obs_onset)
-            obs_onset_doy = obs_onset_dt.dayofyear  # Day of year for observed onset
+        n_bins = len(extended_bins)
+        agg_spec = {'obs_onset_dt': ('obs_onset_dt', 'first'),
+                    'obs_onset_doy': ('obs_onset_doy', 'first')}
+        for k in range(n_bins):
+            agg_spec[f'in_{k}'] = (f'in_{k}', 'sum')
+            agg_spec[f'ob_{k}'] = (f'ob_{k}', 'first')
+            agg_spec[f'ct_{k}'] = (f'ct_{k}', 'sum')
+        g = m.groupby(loc, as_index=False, sort=True).agg(**agg_spec)
+        for k in range(n_bins):
+            g[f'ct_{k}'] = g[f'ct_{k}'].str.rstrip(',')
 
-            # Only process forecasts that are initialized BEFORE the observed onset (by day of year)
-            if init_doy >= obs_onset_doy:
-                continue
+        # Skip locations where no member showed onset in any bin
+        g['total_members_with_onset'] = g[[f'in_{k}' for k in range(n_bins)]].sum(axis=1)
+        g = g[g['total_members_with_onset'] > 0]
+        if g.empty:
+            continue
 
-            # Get ensemble member onsets for this location using the same indices
-            ensemble_onsets = ensemble_onset_da.isel(lat=lat_idx, lon=lon_idx).values
+        for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
+            if bin_start == -float('inf'):
+                bin_label = f'Before day {min_forecast_day}'
+            elif bin_start > max_forecast_day:
+                bin_label = f'After day {max_forecast_day}'
+            else:
+                bin_label = f'Days {bin_start}-{bin_end}'
 
-            # Convert ensemble onsets to days from initialization using day-of-year
-            ensemble_forecast_days = []
-            ensemble_years_with_data = []
+            frame = g[loc].copy()
+            frame['init_time'] = init_date.strftime('%Y-%m-%d')
+            frame['bin_start'] = bin_start
+            frame['bin_end'] = bin_end
+            frame['bin_label'] = bin_label
+            frame['members_with_onset'] = g[f'in_{bin_idx}'].values
+            frame['total_members'] = total_members
+            frame['total_members_with_onset'] = g['total_members_with_onset'].values
+            frame['predicted_prob'] = frame['members_with_onset'] / frame['total_members_with_onset']
+            frame['observed_onset'] = g[f'ob_{bin_idx}'].values
+            frame['contributing_years'] = g[f'ct_{bin_idx}'].values
+            frame['n_contributing_years'] = frame['contributing_years'].str.count(',') + (
+                frame['contributing_years'].str.len() > 0).astype(int)
+            frame['year'] = target_year
+            frame['obs_onset_date'] = g['obs_onset_dt'].dt.strftime('%Y-%m-%d').values
+            frame['obs_onset_doy'] = g['obs_onset_doy'].values
+            frame['init_doy'] = init_doy
+            frame['obs_days_from_init_doy'] = g['obs_onset_doy'].values - init_doy
+            frame['bin_index'] = bin_idx
+            frame['forecast_type'] = 'climatological_doy'
+            frames.append(frame)
 
-            for ens_idx, ens_onset in enumerate(ensemble_onsets):
-                ens_year = ensemble_years[ens_idx]
-
-                if pd.notna(ens_onset):
-                    ens_onset_dt = pd.to_datetime(ens_onset)
-                    ens_onset_doy = ens_onset_dt.dayofyear  # Day of year for ensemble onset
-
-                    # Calculate days from initialization using day-of-year difference
-                    days_from_init = ens_onset_doy - init_doy
-                    ensemble_forecast_days.append(days_from_init)
-                    ensemble_years_with_data.append(ens_year)
-                else:
-                    # No onset predicted by this member
-                    ensemble_forecast_days.append(None)
-                    ensemble_years_with_data.append(ens_year)
-
-            total_members = len(ensemble_years)
-
-            # First pass: calculate total members with onset across all bins
-            total_members_with_onset = 0
-            bin_members_onset = []  # Store for second pass
-
-            for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
-                members_with_onset_in_bin = 0
-
-                # Handle the "before initialization" bin
-                if bin_start == -float('inf'):
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        #if member_onset_day is not None and member_onset_day <= 0:
-                        if member_onset_day is not None and member_onset_day <= min_forecast_day - 1:
-                            members_with_onset_in_bin += 1
-
-                # Handle the "after max_forecast_day" bin
-                elif bin_start > max_forecast_day:
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        if member_onset_day is not None and member_onset_day > max_forecast_day:
-                            members_with_onset_in_bin += 1
-
-                else:
-                    # Regular bin within forecast window
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        if member_onset_day is not None and bin_start <= member_onset_day <= bin_end:
-                            members_with_onset_in_bin += 1
-
-                bin_members_onset.append(members_with_onset_in_bin)
-                total_members_with_onset += members_with_onset_in_bin
-
-            # Skip if no members showed onset
-            if total_members_with_onset == 0:
-                continue
-
-            # Second pass: For each day bin, calculate probabilities using total_members_with_onset
-            for bin_idx, (bin_start, bin_end) in enumerate(extended_bins):
-
-                members_with_onset_in_bin = bin_members_onset[bin_idx]
-
-                # Track which years contribute to this bin
-                contributing_years = []
-
-                # Handle the "before initialization" bin
-                if bin_start == -float('inf'):
-                    #bin_label = 'Before initialization'
-                    bin_label = f'Before day {min_forecast_day}'
-
-                    # Check if observed onset occurs before initialization (by day of year)
-                    #observed_onset = int(obs_onset_doy <= init_doy)
-                    observed_onset = int(obs_onset_doy <= init_doy + min_forecast_day - 1 )
-
-                    # Get contributing years
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        if member_onset_day is not None and member_onset_day <= 0:
-                            contributing_years.append(ensemble_years_with_data[i])
-
-                # Handle the "after max_forecast_day" bin
-                elif bin_start > max_forecast_day:
-                    bin_label = f'After day {max_forecast_day}'
-
-                    # Check if observed onset occurs after max_forecast_day (by day of year)
-                    obs_days_from_init = obs_onset_doy - init_doy
-
-                    observed_onset = int(obs_days_from_init > max_forecast_day)
-
-                    # Get contributing years
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        if member_onset_day is not None and member_onset_day > max_forecast_day:
-                            contributing_years.append(ensemble_years_with_data[i])
-
-                else:
-                    # Regular bin within forecast window
-                    bin_label = f'Days {bin_start}-{bin_end}'
-
-                    # Check if observed onset falls within this day bin (by day of year)
-                    obs_days_from_init = obs_onset_doy - init_doy
-                    observed_onset = int(bin_start <= obs_days_from_init <= bin_end)
-
-                    # Get contributing years
-                    for i, member_onset_day in enumerate(ensemble_forecast_days):
-                        if member_onset_day is not None and bin_start <= member_onset_day <= bin_end:
-                            contributing_years.append(ensemble_years_with_data[i])
-
-                # Calculate probability using only members that showed onset
-                predicted_prob = members_with_onset_in_bin / total_members_with_onset
-
-                # Convert contributing years to string for storage
-                contributing_years_str = ','.join(map(str, sorted(contributing_years))) if contributing_years else ''
-
-                # Store result
-                result = {
-                    'init_time': init_date.strftime('%Y-%m-%d'),
-                    'lat': lat,
-                    'lon': lon,
-                    'bin_start': bin_start,
-                    'bin_end': bin_end,
-                    'bin_label': bin_label,
-                    'predicted_prob': predicted_prob,
-                    'observed_onset': observed_onset,
-                    'members_with_onset': members_with_onset_in_bin,
-                    'total_members': total_members,
-                    'total_members_with_onset': total_members_with_onset,  # New field
-                    'contributing_years': contributing_years_str,
-                    'n_contributing_years': len(contributing_years),
-                    'year': target_year,
-                    'obs_onset_date': obs_onset_dt.strftime('%Y-%m-%d'),
-                    'obs_onset_doy': obs_onset_doy,
-                    'init_doy': init_doy,
-                    'obs_days_from_init_doy': obs_days_from_init if 'obs_days_from_init' in locals() else (obs_onset_doy - init_doy),
-                    'bin_index': bin_idx,
-                    'forecast_type': 'climatological_doy'
-                }
-                results_list.append(result)
-
-    # Convert to DataFrame
-    forecast_obs_df = pd.DataFrame(results_list)
+    if frames:
+        forecast_obs_df = pd.concat(frames, ignore_index=True)
+        forecast_obs_df = forecast_obs_df[[
+            'init_time'] + loc + ['bin_start', 'bin_end', 'bin_label', 'predicted_prob',
+            'observed_onset', 'members_with_onset', 'total_members',
+            'total_members_with_onset', 'contributing_years', 'n_contributing_years',
+            'year', 'obs_onset_date', 'obs_onset_doy', 'init_doy',
+            'obs_days_from_init_doy', 'bin_index', 'forecast_type']]
+    else:
+        forecast_obs_df = pd.DataFrame()
 
     if len(forecast_obs_df) == 0:
         print("Warning: No forecast-observation pairs generated")
         return forecast_obs_df
 
     print(f"Generated {len(forecast_obs_df)} climatological forecast-observation pairs")
-    print(f"Unique lat-lon pairs processed: {len(unique_pairs)}")
     print(f"Total bins per forecast: {len(extended_bins)}")
     print(f"Probability range: {forecast_obs_df['predicted_prob'].min():.3f} - {forecast_obs_df['predicted_prob'].max():.3f}")
     print(f"Observed onset rate: {forecast_obs_df['observed_onset'].mean():.3f}")
     print(f"Non-zero probabilities: {(forecast_obs_df['predicted_prob'] > 0).sum()}")
 
     # Verify uniqueness
-    unique_locations_in_output = len(forecast_obs_df[['lat', 'lon']].drop_duplicates())
+    unique_locations_in_output = len(forecast_obs_df[loc].drop_duplicates())
     print(f"Unique locations in output: {unique_locations_in_output}")
 
     # Show distribution across bins

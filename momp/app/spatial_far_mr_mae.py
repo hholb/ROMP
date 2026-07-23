@@ -11,9 +11,10 @@ from momp.lib.convention import Case
 #from momp.lib.loader import cfg,setting
 from momp.lib.loader import get_cfg, get_setting
 from momp.graphics.maps import plot_spatial_metrics
+from momp.graphics.choropleth import plot_adm3_spatial_metrics
 from momp.graphics.onset_map import plot_spatial_climatology_onset
 from momp.graphics.panel_portrait_error import panel_portrait_mae_far_mr
-from momp.io.output import save_metrics_to_netcdf
+from momp.io.output import save_metrics_to_netcdf, save_adm3_metrics_to_csv
 #from momp.io.output import file_path
 from momp.io.output import set_nested
 from momp.utils.printing import tuple_to_str_range
@@ -69,19 +70,25 @@ def spatial_far_mr_mae_map(cfg=None, setting=None):#, **kwargs):
 
         # Save spatial metrics to NetCDF
         if case_cfg["save_nc_spatial_far_mr_mae"]:
-        
+
             desc_dict = {
                     'title': 'Monsoon Onset MAE, FAR, MR Analysis',
-                    'description': """Spatial maps of Mean Absolute Error, False Alarm Rate, and Miss Rate 
+                    'description': """Spatial maps of Mean Absolute Error, False Alarm Rate, and Miss Rate
                     for monsoon onset predictions""",
             }
 
             save_metrics_to_netcdf(spatial_metrics, case_cfg, desc_dict=desc_dict)
 
+            if case_cfg.get('benchmark_space') == 'adm3':
+                save_adm3_metrics_to_csv(spatial_metrics, case_cfg)
+
 
         # make spatial metrics plot
         if case_cfg['plot_spatial_far_mr_mae']:
-            plot_spatial_metrics(spatial_metrics, **case_cfg)
+            if case_cfg.get('benchmark_space') == 'adm3':
+                plot_adm3_spatial_metrics(spatial_metrics, **case_cfg)
+            else:
+                plot_spatial_metrics(spatial_metrics, **case_cfg)
 
 
 #        # make climatological onset plot
@@ -152,15 +159,21 @@ def spatial_far_mr_mae_map(cfg=None, setting=None):#, **kwargs):
         if case_cfg["save_nc_spatial_far_mr_mae"]:
             desc_dict = {
                     'title': 'Monsoon Onset MAE, FAR, MR Analysis',
-                    'description': """Spatial maps of Mean Absolute Error, False Alarm Rate, and Miss Rate 
+                    'description': """Spatial maps of Mean Absolute Error, False Alarm Rate, and Miss Rate
                     for monsoon onset predictions""",
             }
             save_metrics_to_netcdf(spatial_metrics, case_cfg_ref, desc_dict=desc_dict)
 
+            if case_cfg_ref.get('benchmark_space') == 'adm3':
+                save_adm3_metrics_to_csv(spatial_metrics, case_cfg_ref)
+
 
         # make spatial metrics plot
         if case_cfg['plot_spatial_far_mr_mae']:
-            plot_spatial_metrics(spatial_metrics, **case_cfg_ref)
+            if case_cfg_ref.get('benchmark_space') == 'adm3':
+                plot_adm3_spatial_metrics(spatial_metrics, **case_cfg_ref)
+            else:
+                plot_spatial_metrics(spatial_metrics, **case_cfg_ref)
 
 
     # save climatological onset to netcdf
@@ -173,7 +186,10 @@ def spatial_far_mr_mae_map(cfg=None, setting=None):#, **kwargs):
 
     # spatial map of climatology onset day
     if case_cfg['plot_climatology_onset']:
-        plot_spatial_climatology_onset(onset_da_dict, **case_cfg_ref)
+        if case_cfg_ref.get('benchmark_space') == 'adm3':
+            print("plot_climatology_onset is not supported for adm3 benchmarking; skipping.")
+        else:
+            plot_spatial_climatology_onset(onset_da_dict, **case_cfg_ref)
 
 #    if 2 > 1:
 #        import pickle
