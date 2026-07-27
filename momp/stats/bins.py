@@ -563,9 +563,10 @@ def multi_year_forecast_obs_pairs(*, years, obs_dir, obs_file_pattern, obs_var,
 
             print(f"Year {year} completed: {len(forecast_obs_pairs)} forecast-observation pairs")
 
-        except Exception as e:
-            print(f"Error processing year {year}: {e}")
-            raise
+        except FileNotFoundError as e:
+            # Reforecast archives commonly have year gaps; skip years whose
+            # model or observation file is absent instead of aborting the run.
+            print(f"Skipping year {year} (missing input file): {e}")
             continue
 
     # Combine all years
