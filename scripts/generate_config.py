@@ -22,6 +22,8 @@ Optional env vars (with defaults matching the demo config):
   ROMP_WET_SPELL        - wet spell length days (default: 3)
   ROMP_DRY_SPELL        - dry spell length days (default: 7)
   ROMP_DRY_EXTENT       - dry spell search window days (default: 0)
+  ROMP_ONSET_RULE       - onset definition name from momp.stats.onset_rule (default: legacy)
+  ROMP_ONSET_RULE_PARAMS- JSON dict of parameters for ROMP_ONSET_RULE (default: rule defaults)
   ROMP_START_DATE       - evaluation start as YYYY-MM-DD (default: 2019-05-01)
   ROMP_END_DATE         - evaluation end as YYYY-MM-DD (default: 2024-07-31)
   ROMP_START_YEAR_CLIM  - climatology start year (default: 1998)
@@ -36,6 +38,7 @@ Optional env vars (with defaults matching the demo config):
   ROMP_DATE_FILTER_YEAR - reference year for init-day calendar alignment (default: start_date year)
 """
 
+import json
 import os
 import sys
 from datetime import datetime
@@ -79,6 +82,8 @@ def main():
     wet_spell       = opt("ROMP_WET_SPELL",        "3")
     dry_spell       = opt("ROMP_DRY_SPELL",        "7")
     dry_extent      = opt("ROMP_DRY_EXTENT",       "0")
+    onset_rule      = opt("ROMP_ONSET_RULE",       "legacy")
+    onset_rule_params_raw = opt("ROMP_ONSET_RULE_PARAMS", "")
     start_date_str  = opt("ROMP_START_DATE",       "2019-05-01")
     end_date_str    = opt("ROMP_END_DATE",         "2024-07-31")
     start_yr_clim   = opt("ROMP_START_YEAR_CLIM",  "1998")
@@ -96,6 +101,15 @@ def main():
     end_date   = parse_date(end_date_str)
 
     date_filter_year = int(date_filter_year_s) if date_filter_year_s else start_date[0]
+
+    if onset_rule_params_raw.strip():
+        parsed = json.loads(onset_rule_params_raw)
+        if not isinstance(parsed, dict):
+            print("ERROR: ROMP_ONSET_RULE_PARAMS must be a JSON object", file=sys.stderr)
+            sys.exit(1)
+        onset_rule_params = repr(parsed)
+    else:
+        onset_rule_params = "None"
 
     init_days = "(" + ", ".join(init_days_raw.split(",")) + ",)"
 
@@ -149,6 +163,8 @@ dry_extent = {dry_extent}
 thresh_file = {thresh_file}
 thresh_var = None
 onset_percentage_threshold = 0.5
+onset_rule = "{onset_rule}"
+onset_rule_params = {onset_rule_params}
 
 start_date = {start_date}
 end_date = {end_date}
