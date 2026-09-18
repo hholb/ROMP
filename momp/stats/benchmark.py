@@ -25,6 +25,9 @@ def compute_onset_metrics_with_windows(onset_df, *, tolerance_days, verification
     forecast_bin_end = verification_window[1]
 
     results_list = []
+    if onset_df.empty:
+        # Small domains (e.g. a user focus area) can have no forecast onsets in a year.
+        onset_df = pd.DataFrame(columns=['lat', 'lon'])
     unique_locations = onset_df[['lat', 'lon']].drop_duplicates()
 
     print(f"Processing {len(unique_locations)} unique grid points...")
@@ -152,6 +155,12 @@ def compute_onset_metrics_with_windows(onset_df, *, tolerance_days, verification
 #    sys.exit()
 
     metrics_df = pd.DataFrame(results_list)
+    if metrics_df.empty:
+        metrics_df = pd.DataFrame(columns=[
+            'lat', 'lon', 'total_forecasts', 'true_positive', 'true_negative',
+            'false_positive', 'false_negative', 'num_onset', 'num_no_onset',
+            'mae_combined', 'mae_tp_only',
+        ])
 
     summary_stats = {
         'total_grid_points': len(metrics_df),
