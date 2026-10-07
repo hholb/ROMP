@@ -18,6 +18,10 @@ Optional env vars (with defaults matching the demo config):
   ROMP_OBS_VAR          - rainfall variable name in obs file (default: RAINFALL)
   ROMP_MODEL_VAR        - rainfall variable name in forecast file (default: tp)
   ROMP_FILE_PATTERN     - forecast file naming pattern (default: {}.nc)
+  ROMP_UNIT_CVT         - multiplier converting forecast rainfall to mm (default: None)
+  ROMP_MODEL_DIMS       - JSON object naming the forecast file's dims, e.g.
+                          {"init_time": "time", "step": "prediction_timedelta_daily"}
+                          (default: None, infer from names)
   ROMP_REGION           - target region (default: Ethiopia)
   ROMP_NC_MASK          - path to land/region mask NetCDF (default: None)
   ROMP_THRESH_FILE      - path to spatial threshold NetCDF (default: None)
@@ -40,6 +44,7 @@ Optional env vars (with defaults matching the demo config):
   ROMP_DATE_FILTER_YEAR - reference year for init-day calendar alignment (default: start_date year)
 """
 
+import json
 import math
 import os
 import sys
@@ -109,6 +114,27 @@ def optional_path(val: str) -> str | None:
     return val or None
 
 
+def optional_number(val: str) -> int | float | None:
+    return parse_number(val) if val else None
+
+
+MODEL_DIM_NAMES = frozenset({"init_time", "step", "member", "lat", "lon"})
+
+
+def parse_model_dims(val: str) -> dict | None:
+    if not val:
+        return None
+    dims = json.loads(val)
+    if not isinstance(dims, dict):
+        raise ValueError("must be a JSON object")
+    unknown = sorted(set(dims) - MODEL_DIM_NAMES)
+    if unknown:
+        raise ValueError(f"unknown dims {unknown}; expected some of {sorted(MODEL_DIM_NAMES)}")
+    if not all(isinstance(name, str) and name for name in dims.values()):
+        raise ValueError("file dim names must be non-empty strings")
+    return dims
+
+
 def config_values() -> dict:
     obs_dir = require("ROMP_OBS_DIR")
     model_dir = require("ROMP_MODEL_DIR")
@@ -140,8 +166,9 @@ def config_values() -> dict:
         "ref_model_unit_cvt": None,
         "model_dir_list": (model_dir,),
         "model_var_list": (opt("ROMP_MODEL_VAR", "tp"),),
-        "unit_cvt_list": (None,),
+        "unit_cvt_list": (_parsed("ROMP_UNIT_CVT", "", optional_number),),
         "file_pattern_list": (opt("ROMP_FILE_PATTERN", "{}.nc"),),
+        "model_dims_list": (_parsed("ROMP_MODEL_DIMS", "", parse_model_dims),),
         "region": opt("ROMP_REGION", "Ethiopia"),
         "nc_mask": _parsed("ROMP_NC_MASK", "", optional_path),
         "shpfile_dir": None,

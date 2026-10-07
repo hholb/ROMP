@@ -101,6 +101,8 @@ def test_text_settings_stay_inert_strings(tmp_path, name):
         "ROMP_DRY_SPELL",
         "ROMP_PROBABILISTIC",
         "ROMP_PARALLEL",
+        "ROMP_UNIT_CVT",
+        "ROMP_MODEL_DIMS",
     ],
 )
 def test_non_text_settings_that_are_not_values_are_rejected(tmp_path, name):
@@ -113,3 +115,38 @@ def test_non_text_settings_that_are_not_values_are_rejected(tmp_path, name):
     assert name in result.stderr
     assert not (tmp_path / "config.in").exists()
     assert not marker.exists()
+
+
+def test_model_unit_conversion_and_dims_reach_the_per_model_lists(tmp_path):
+    result = _generate(
+        tmp_path,
+        ROMP_UNIT_CVT="1000",
+        ROMP_MODEL_DIMS='{"init_time": "time", "step": "prediction_timedelta_daily"}',
+    )
+    assert result.returncode == 0
+
+    config = _exec_config(tmp_path)
+
+    assert config["unit_cvt_list"] == (1000,)
+    assert config["model_dims_list"] == (
+        {"init_time": "time", "step": "prediction_timedelta_daily"},
+    )
+
+
+def test_model_dims_default_to_name_inference(tmp_path):
+    assert _generate(tmp_path).returncode == 0
+
+    config = _exec_config(tmp_path)
+
+    assert config["unit_cvt_list"] == (None,)
+    assert config["model_dims_list"] == (None,)
+
+
+@pytest.mark.parametrize(
+    "value", ['["time"]', '{"valid_time": "time"}', '{"init_time": ""}']
+)
+def test_malformed_model_dims_are_rejected(tmp_path, value):
+    result = _generate(tmp_path, ROMP_MODEL_DIMS=value)
+
+    assert result.returncode == 1
+    assert "ROMP_MODEL_DIMS" in result.stderr
