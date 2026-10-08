@@ -26,6 +26,9 @@ def compute_onset_metrics_with_windows(onset_df, *, tolerance_days, verification
     forecast_bin_end = verification_window[1]
 
     loc = loc_cols(onset_df)
+    if onset_df.empty:
+        # Small domains (e.g. a user focus area) can have no forecast onsets in a year.
+        onset_df = onset_df.reindex(columns=loc + ['init_time', 'onset_date', 'obs_onset_date'])
 
     df = onset_df[loc + ['init_time', 'onset_date', 'obs_onset_date']].copy()
     df['obs_onset_dt'] = pd.to_datetime(df['obs_onset_date'])
